@@ -45,14 +45,22 @@ function getConfig(env) {
 // ─── 主入口 ───────────────────────────────────────────────────
 export default {
 
-  // Cron：每天 UTC 02:00 清理 D1 过期数据
+  // Cron 调度：
+  //   */20 * * * *  → 每20分钟重试 pending 状态文件（因 lag 窗口被延迟处理的文件）
+  //   0 2 * * *     → 每天 UTC 02:00 清理 D1 过期数据
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(cleanupOldData(env));
+    if (event.cron === '0 2 * * *') {
+      ctx.waitUntil(cleanupOldData(env));
+    } else {
+      ctx.waitUntil(retryPendingFiles(env));
+    }
   },
 
   // Queue Consumer：处理 R2 Event Notification 触发的新文件
   async queue(batch, env, ctx) {
     for (const msg of batch.messages) {
+      // R2 Event Notification 格式：{ object: { key: "..." } }
+      // 直接入队格式：{ key: "..." }
       const key = msg.body?.object?.key || msg.body?.key;
       if (!key || !key.endsWith('.gz')) { msg.ack(); continue; }
       try {
@@ -83,21 +91,23 @@ export default {
 async function processFile(key, env) {
   const c = getConfig(env);
 
-  // 幂等保护：已处理的文件跳过
+  // 幂等保护 + 超时检测（同时查 status 和 started_at）
   const existing = await env.DB.prepare(
-    `SELECT status FROM processed_files WHERE r2_key = ?`
+    `SELECT status, started_at FROM processed_files WHERE r2_key = ?`
   ).bind(key).first();
   if (existing?.status === 'done') {
     log(env, 'info', `Already done, skip: ${key}`); return;
   }
 
-  // 超时的 processing 重置
+  // processing 状态：检查是否超时（超时则允许重新处理）
   if (existing?.status === 'processing') {
-    const stuckAt = existing.started_at || '';
+    const stuckAt   = existing.started_at || '';
     const threshold = new Date(Date.now() - c.maxProcessingMin * 60 * 1000).toISOString();
     if (stuckAt > threshold) {
-      log(env, 'debug', `Still processing: ${key}`); return;
+      // 仍在正常处理时间内，跳过避免重复处理
+      log(env, 'debug', `Still processing (not timed out): ${key}`); return;
     }
+    log(env, 'warn', `Processing timed out, retrying: ${key}`);
   }
 
   await env.DB.prepare(`
@@ -154,12 +164,14 @@ async function processFile(key, env) {
     reader.releaseLock();
   }
 
-  // 所有行都被 lag 过滤 = 文件太新，重置为 pending 等下次触发
-  if (skippedLag > 0 && lineCount === 0 && skippedFilter === 0 && errCount === 0) {
+  // 有行被 lag 过滤 = 文件包含当前 lag 窗口内的数据，需要稍后重试补全
+  // 无论是否有其他行已处理，都重置为 pending 等 Cron 重试
+  // 注意：已写入 D1 的部分数据不受影响（累加 upsert 是幂等的）
+  if (skippedLag > 0) {
     await env.DB.prepare(
-      `UPDATE processed_files SET status='pending', error_msg='all_lag_retry' WHERE r2_key=?`
+      `UPDATE processed_files SET status='pending', error_msg='has_lag_retry' WHERE r2_key=?`
     ).bind(key).run();
-    log(env, 'info', `All lines too new, reset pending: ${key}`);
+    log(env, 'info', `File has lag rows, reset pending for retry: ${key} lag=${skippedLag} ok=${lineCount}`);
     return;
   }
 
@@ -415,6 +427,32 @@ async function sendFeishu(url, { title, zone, timeStr, mbps, detail, dashUrl }) 
       card: { header: { title: { tag: 'plain_text', content: title }, template: 'red' }, elements },
     }),
   });
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Cron 每20分钟：重试 pending 状态文件
+// pending = 之前因 lag 窗口被推迟，现在 lag 窗口已过，可以重新处理
+// ═══════════════════════════════════════════════════════════════
+async function retryPendingFiles(env) {
+  const c = getConfig(env);
+
+  // 只重试 lag 窗口已过的 pending 文件
+  // 通过文件名里的时间戳判断：文件名格式 logs/YYYYMMDD/YYYYMMDDTHHmmssZ_...
+  // 简单起见：查所有 pending 文件，让 processFile 自己判断是否还在 lag 内
+  const rows = (await env.DB.prepare(
+    `SELECT r2_key FROM processed_files WHERE status = 'pending' LIMIT 20`
+  ).all()).results;
+
+  if (rows.length === 0) return;
+
+  log(env, 'info', `Cron retry: found ${rows.length} pending files`);
+  for (const { r2_key } of rows) {
+    try {
+      await processFile(r2_key, env);
+    } catch (err) {
+      log(env, 'warn', `Retry failed for ${r2_key}: ${err.message}`);
+    }
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════

@@ -9,9 +9,11 @@ compatibility_flags = ["nodejs_compat"]
 enabled         = true
 invocation_logs = true
 
-# ── Cron：每天 UTC 02:00 清理 D1 过期数据 ────────────────────
+# ── Cron 调度 ─────────────────────────────────────────────────
+# 1. 每20分钟重试因 lag 窗口被延迟的 pending 文件（确保数据不丢失）
+# 2. 每天 UTC 02:00 清理 D1 过期数据（7天保留期）
 [triggers]
-crons = ["0 2 * * *"]
+crons = ["*/20 * * * *", "0 2 * * *"]
 
 # ── R2 存储桶（Logpush 同一个桶，R2 Binding 只读）─────────────
 # binding 不要改；bucket_name 改为你的 Logpush R2 桶名

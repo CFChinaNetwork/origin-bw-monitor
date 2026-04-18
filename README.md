@@ -1,6 +1,26 @@
 # origin-bw-monitor
 
-**CF Origin Pull Bandwidth Monitor** — A Cloudflare Worker deployed in your own account that reads your Logpush R2 logs and renders a per-minute origin pull bandwidth chart dashboard.
+**CF Origin Pull Bandwidth Monitor** — A Cloudflare Worker deployed in your own account that automatically computes per-minute origin pull bandwidth from Logpush R2 logs and renders a real-time chart dashboard with alerting.
+
+## How It Works
+
+```
+Logpush writes new .gz file to R2
+    ↓ R2 Event Notification (2–5 sec)
+bw-ingest-queue
+    ↓ Queue Consumer
+Stream decompress → parse → official formula → write D1
+    ↓
+Alert check (previous minute cumulative bandwidth from D1)
+    ↓
+Dashboard chart (query D1 → Chart.js)
+```
+
+**Key design:**
+- **Event-driven only** — processes new files via R2 Event Notification; no historical backfill
+- **Read-only on R2** — never writes, modifies, or deletes R2 objects
+- **Safe Lag Window** — waits 10 min before processing, ensuring all Logpush files for a given minute have landed
+- **Pending retry** — files too new for the lag window are retried every 20 min via Cron
 
 ## Formula
 
@@ -11,6 +31,12 @@ SUM(CacheResponseBytes) WHERE OriginResponseStatus NOT IN (0, 304)
 
 Reference: https://developers.cloudflare.com/logs/faq/common-calculations/
 
+| OriginResponseStatus | Meaning | Included |
+|---|---|---|
+| `0` | Cache HIT — no origin request | ❌ |
+| `304` | Revalidated — no body transferred | ❌ |
+| Others | Real origin response with body | ✅ |
+
 ## Quick Start
 
 ```bash
@@ -18,7 +44,7 @@ Reference: https://developers.cloudflare.com/logs/faq/common-calculations/
 git clone https://github.com/CFChinaNetwork/origin-bw-monitor.git
 cd origin-bw-monitor
 
-# 2. Create D1 database → copy database_id into wrangler.toml
+# 2. Create D1 → copy database_id into wrangler.toml
 wrangler d1 create bw-stats
 
 # 3. Init tables
@@ -28,21 +54,48 @@ wrangler d1 execute bw-stats --file=./schema.sql --remote
 wrangler queues create bw-ingest-queue
 wrangler queues create bw-ingest-dlq
 
-# 5. Edit wrangler.toml — fill in your bucket name, D1 id, START_TIME
+# 5. Edit wrangler.toml — fill in bucket_name and database_id
 
-# 6. Configure R2 Event Notification
+# 6. Configure R2 Event Notification (CF Dashboard)
 #    R2 Bucket → Settings → Event Notifications → Add
 #    Event: object-create → Queue: bw-ingest-queue
 
-# 7. (Optional) Set Dashboard token
-wrangler secret put DASHBOARD_TOKEN
-
-# 8. Deploy
+# 7. Deploy
 wrangler deploy
 
-# 9. Open Dashboard
-# https://origin-bw-monitor.<your-subdomain>.workers.dev/?hours=24
+# 8. Open Dashboard
+# https://origin-bw-monitor.<subdomain>.workers.dev/?hours=24
 ```
+
+## Alerting
+
+Supports **WeCom / DingTalk / Feishu** webhook alerts (any combination):
+
+```bash
+wrangler secret put ALERT_WEBHOOK_WECOM      # Enterprise WeChat
+wrangler secret put ALERT_WEBHOOK_DINGTALK   # DingTalk
+wrangler secret put ALERT_WEBHOOK_FEISHU     # Feishu / Lark
+```
+
+Configure thresholds in `wrangler.toml`:
+```toml
+ALERT_THRESHOLD_MBPS   = "500"   # Alert when bandwidth > 500 Mbps
+ALERT_SPIKE_MULTIPLIER = "5"     # Alert when bandwidth > 5× 24h peak
+ALERT_COOLDOWN_MIN     = "30"    # Min interval between same alerts
+ALERT_DASHBOARD_URL    = "https://origin-bw-monitor.xxx.workers.dev"
+```
+
+Leave empty to disable that alert type.
+
+## End-to-End Latency
+
+| Stage | Latency |
+|---|---|
+| Logpush batch interval | ~60 sec |
+| R2 Event Notification | 2–5 sec |
+| Queue + Worker processing | 5–30 sec |
+| Safe Lag Window | +10 min |
+| **Total chart data lag** | **~12–15 min** |
 
 ## Documentation
 
