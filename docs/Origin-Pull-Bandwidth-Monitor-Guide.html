@@ -1,0 +1,395 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CF Origin Pull Bandwidth Monitor — Deployment Guide</title>
+<style>
+  :root {
+    --orange: #f6821f; --dark: #1a1a2e; --bg: #f8f9fa; --white: #fff;
+    --border: #e0e0e8; --code-bg: #f0f0f4; --text: #333; --muted: #666;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, 'Segoe UI', Arial, sans-serif; font-size: 14px;
+         line-height: 1.7; color: var(--text); background: var(--bg); }
+  .header { background: var(--dark); color: #fff; padding: 32px 48px; }
+  .header h1 { font-size: 24px; font-weight: 800; color: var(--orange); margin-bottom: 4px; }
+  .header .sub { font-size: 12px; color: #888; letter-spacing: 0.5px; }
+  nav { background: var(--dark); border-top: 1px solid #2a2a3e; padding: 10px 48px;
+        display: flex; gap: 24px; font-size: 12px; }
+  nav a { color: #aaa; text-decoration: none; } nav a:hover { color: var(--orange); }
+  .main { max-width: 960px; margin: 0 auto; padding: 40px 48px; }
+  h2 { font-size: 18px; font-weight: 800; color: var(--dark); padding: 10px 16px;
+       background: var(--dark); color: #fff; border-radius: 5px; margin: 40px 0 16px; }
+  h2 .num { background: var(--orange); color: #000; padding: 2px 8px; border-radius: 3px;
+            font-size: 12px; margin-right: 8px; }
+  h3 { font-size: 14px; font-weight: 700; color: var(--dark); margin: 20px 0 8px;
+       padding-left: 10px; border-left: 3px solid var(--orange); }
+  p { margin-bottom: 10px; color: var(--text); }
+  ul, ol { margin: 8px 0 12px 24px; }
+  li { margin-bottom: 4px; }
+  code { background: var(--code-bg); padding: 1px 6px; border-radius: 3px;
+         font-family: 'Courier New', monospace; font-size: 12px; color: #c0392b; }
+  pre { background: var(--dark); color: #e0e0e0; padding: 16px 20px; border-radius: 6px;
+        overflow-x: auto; font-size: 12.5px; line-height: 1.6; margin: 10px 0 16px; }
+  pre code { background: none; color: inherit; padding: 0; font-size: inherit; }
+  table { width: 100%; border-collapse: collapse; margin: 10px 0 18px; font-size: 13px; }
+  thead tr { background: var(--dark); color: #fff; }
+  thead th { padding: 9px 12px; text-align: left; font-weight: 600; }
+  tbody tr:nth-child(even) { background: #f7f8fc; }
+  tbody td { padding: 8px 12px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 3px; font-size: 11px; font-weight: 700; }
+  .badge-req { background: #fde8d8; color: #b94a00; border: 1px solid #f6c5a0; }
+  .badge-opt { background: #e6f4ea; color: #1e7e34; border: 1px solid #b7dfbf; }
+  .arch-box { background: var(--dark); color: #e0e0e0; border-radius: 8px; padding: 24px;
+              font-family: 'Courier New', monospace; font-size: 12.5px; line-height: 1.8;
+              overflow-x: auto; margin: 16px 0; }
+  .arch-box .step { color: var(--orange); font-weight: 700; }
+  .arch-box .comment { color: #888; }
+  .note { background: #fff8f2; border-left: 4px solid var(--orange); padding: 10px 16px;
+          border-radius: 0 4px 4px 0; margin: 12px 0; font-size: 13px; }
+  .note strong { color: var(--orange); }
+  .footer { text-align: center; font-size: 11px; color: #aaa; padding: 32px; border-top: 1px solid var(--border); }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="sub">Cloudflare Workers + R2 + Queues + D1 · Origin Bandwidth Monitoring</div>
+  <h1>CF Origin Pull Bandwidth Monitor</h1>
+  <div class="sub">Deployment &amp; Operations Guide</div>
+</div>
+
+<nav>
+  <a href="#overview">Overview</a>
+  <a href="#architecture">Architecture</a>
+  <a href="#formula">Formula</a>
+  <a href="#deploy">Deployment</a>
+  <a href="#config">Configuration</a>
+  <a href="#import">Import Historical Data</a>
+  <a href="#ops">Operations</a>
+</nav>
+
+<div class="main">
+
+<!-- ── 1. Overview ── -->
+<h2 id="overview"><span class="num">1</span> Overview</h2>
+
+<p>This tool deploys a Cloudflare Worker <strong>in your own account</strong> that reads your existing Logpush R2 logs, computes per-minute origin pull bandwidth using the official Cloudflare formula, and presents the results as a real-time chart dashboard.</p>
+
+<table>
+  <thead><tr><th>Item</th><th>Details</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Purpose</strong></td><td>Visualize how much bandwidth your origin server is serving to Cloudflare (i.e., cache miss traffic)</td></tr>
+    <tr><td><strong>Stack</strong></td><td>100% Cloudflare-native: Logpush + R2 + Queues + Workers + D1</td></tr>
+    <tr><td><strong>Deployment</strong></td><td>Deployed in <strong>your own Cloudflare account</strong> — no cross-account access, no external servers</td></tr>
+    <tr><td><strong>R2 Access</strong></td><td>Read-only via R2 Binding — <strong>never writes to your R2</strong></td></tr>
+    <tr><td><strong>Data Retention</strong></td><td>7 days (configurable), auto-cleaned daily</td></tr>
+    <tr><td><strong>Chart Lag</strong></td><td>~20 minutes (Safe Lag Window + Cron interval)</td></tr>
+  </tbody>
+</table>
+
+<h3>Cloudflare Services Used</h3>
+<table>
+  <thead><tr><th>Service</th><th>Role</th><th>Dashboard Location</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Logpush</strong></td><td>Already running — exports HTTP request logs to R2 every ~1 min</td><td>Zone → Analytics &amp; Logs → Logpush</td></tr>
+    <tr><td><strong>R2 Object Storage</strong></td><td>Stores Logpush files. This Worker reads (never writes) these files via R2 Binding</td><td>Dashboard → R2</td></tr>
+    <tr><td><strong>R2 Event Notifications</strong></td><td>Fires a Queue message every time Logpush writes a new file — enables near-real-time processing</td><td>R2 Bucket → Settings → Event Notifications</td></tr>
+    <tr><td><strong>Queues</strong></td><td>Decouples R2 event detection from file processing; provides at-least-once delivery with retry</td><td>Dashboard → Workers &amp; Pages → Queues</td></tr>
+    <tr><td><strong>Workers</strong></td><td>One script handles: Cron scan, Queue consumer (stream parse + write D1), Dashboard HTTP</td><td>Deployed via <code>wrangler deploy</code></td></tr>
+    <tr><td><strong>D1 (SQLite)</strong></td><td>Stores per-minute bandwidth aggregates. 7-day retention, auto-cleaned</td><td>Dashboard → Workers &amp; Pages → D1</td></tr>
+  </tbody>
+</table>
+
+<!-- ── 2. Architecture ── -->
+<h2 id="architecture"><span class="num">2</span> Architecture</h2>
+
+<div class="arch-box">
+<span class="comment">┌─────────────────────────────────────────────────────────────────────────────┐</span>
+<span class="comment">│  [Already running] Your existing Logpush job                               │</span>
+<span class="comment">│                                                                             │</span>
+<span class="comment">│  CF Edge processes every HTTP request and buffers access logs internally    │</span>
+<span class="comment">│  Every ~1 minute, Logpush automatically:                                    │</span>
+<span class="comment">│    1. Packages all logs from the past ~60s into a .log.gz file (ndjson)     │</span>
+<span class="comment">│    2. Writes it to your R2 bucket                                           │</span>
+<span class="comment">│                                                                             │</span>
+<span class="comment">│  R2 Bucket:  your-logpush-bucket/                                           │</span>
+<span class="comment">│    └── logs/                                                                │</span>
+<span class="comment">│          └── 20260414/                                                      │</span>
+<span class="comment">│                ├── 20260414T100000Z_abc123.log.gz   ← ~10–150 MB each       │</span>
+<span class="comment">│                ├── 20260414T100100Z_def456.log.gz   ← new file every ~1 min │</span>
+<span class="comment">│                └── ...                                                      │</span>
+<span class="comment">└───────────────────────────────────────┬─────────────────────────────────────┘</span>
+                                        │
+                <span class="step">[Step 1]</span> R2 detects new object → fires Event Notification (2–5 sec)
+                                        │
+                                        ▼
+<span class="comment">┌─────────────────────────────────────────────────────────────────────────────┐</span>
+<span class="comment">│  bw-ingest-queue                                                            │</span>
+<span class="comment">│                                                                             │</span>
+<span class="comment">│  Message: { "key": "logs/20260414/20260414T100000Z_abc123.log.gz" }         │</span>
+<span class="comment">│  (Queue message carries only the R2 object key — a few dozen bytes,         │</span>
+<span class="comment">│   well within the 128 KB Queue message size limit)                          │</span>
+<span class="comment">└───────────────────────────────────────┬─────────────────────────────────────┘</span>
+                                        │
+                <span class="step">[Step 2]</span> Queue wakes up Worker (3–15 sec, max_batch_size=3)
+                                        │
+                                        ▼
+<span class="comment">┌─────────────────────────────────────────────────────────────────────────────┐</span>
+<span class="comment">│  Queue Consumer Worker — Stream Parse + Aggregate                           │</span>
+<span class="comment">│                                                                             │</span>
+<span class="comment">│  ① env.LOGPUSH_BUCKET.get(key)  ← R2 Binding, read-only, no API key needed │</span>
+<span class="comment">│                                                                             │</span>
+<span class="comment">│  ② obj.body.pipeThrough(new DecompressionStream('gzip'))                   │</span>
+<span class="comment">│       Stream decompress — never buffers the full file in memory             │</span>
+<span class="comment">│       Memory stays constant regardless of file size (128 MB Worker limit)   │</span>
+<span class="comment">│                                                                             │</span>
+<span class="comment">│  ③ Per line: JSON.parse → apply formula                                     │</span>
+<span class="comment">│       if OriginResponseStatus == 0:   skip (HIT, no origin request)         │</span>
+<span class="comment">│       if OriginResponseStatus == 304: skip (revalidated, no body transfer)  │</span>
+<span class="comment">│       else: sum += CacheResponseBytes                                       │</span>
+<span class="comment">│                                                                             │</span>
+<span class="comment">│  ④ Bucket by EdgeEndTimestamp (request end time) → per-minute aggregation   │</span>
+<span class="comment">│       key = "2026-04-14T03:01|example.com"                                  │</span>
+<span class="comment">│       value = { sum: total_bytes_for_this_minute }                          │</span>
+<span class="comment">└───────────────────────────────────────┬─────────────────────────────────────┘</span>
+                                        │
+                <span class="step">[Step 3]</span> Batch upsert into D1 (accumulative, idempotent)
+                                        │
+                                        ▼
+<span class="comment">┌─────────────────────────────────────────────────────────────────────────────┐</span>
+<span class="comment">│  D1 Database — bw_stats table                                               │</span>
+<span class="comment">│                                                                             │</span>
+<span class="comment">│  minute_utc          zone                sum_bytes                          │</span>
+<span class="comment">│  ─────────────────── ──────────────────  ─────────                          │</span>
+<span class="comment">│  2026-04-14T03:01    example.com         2,974,063,359   ← bytes this min   │</span>
+<span class="comment">│  2026-04-14T03:02    example.com         1,815,429,212                       │</span>
+<span class="comment">│  ...                                                                        │</span>
+<span class="comment">│                                                                             │</span>
+<span class="comment">│  Mbps = sum_bytes / 60s × 8bits / 1024²                                     │</span>
+<span class="comment">│  Retention: 7 days, auto-cleaned daily at UTC 02:00                         │</span>
+<span class="comment">└───────────────────────────────────────┬─────────────────────────────────────┘</span>
+                                        │
+                <span class="step">[Step 4]</span> Dashboard Worker serves HTTP chart
+                                        │
+                                        ▼
+<span class="comment">┌─────────────────────────────────────────────────────────────────────────────┐</span>
+<span class="comment">│  Dashboard                                                                  │</span>
+<span class="comment">│                                                                             │</span>
+<span class="comment">│  Browser → GET / → Worker queries D1 → Chart.js renders bandwidth curve    │</span>
+<span class="comment">│  URL: https://origin-bw-monitor.&lt;subdomain&gt;.workers.dev/                   │</span>
+<span class="comment">│       ?zone=example.com&amp;hours=24                                            │</span>
+<span class="comment">└─────────────────────────────────────────────────────────────────────────────┘</span>
+</div>
+
+<h3>Trigger Mechanism</h3>
+<table>
+  <thead><tr><th>Stage</th><th>Trigger</th><th>Latency</th></tr></thead>
+  <tbody>
+    <tr><td>Logpush → R2</td><td>Time-driven, ~60s interval (CF internal)</td><td>The only clock in the pipeline</td></tr>
+    <tr><td>R2 → Queue</td><td>Event-driven: R2 Event Notification fires on every new object</td><td>2–5 seconds after R2 write</td></tr>
+    <tr><td>Queue → Worker</td><td>Event-driven: Worker wakes on <code>max_batch_size=3</code> or <code>max_batch_timeout=30s</code></td><td>3–15 seconds</td></tr>
+    <tr><td>Worker → D1</td><td>Within the same Worker invocation</td><td>Milliseconds</td></tr>
+    <tr><td>Total end-to-end</td><td>Logpush (~60s) + Event Notification (~5s) + Queue (~15s) + Processing (~30s)</td><td><strong>~2 minutes</strong></td></tr>
+    <tr><td>Safe Lag Window</td><td>Additional buffer to ensure all files for a given minute have landed</td><td><strong>+10 minutes</strong></td></tr>
+    <tr><td><strong>Chart data lag</strong></td><td>Total from request to visible on chart</td><td><strong>~12–20 minutes</strong></td></tr>
+  </tbody>
+</table>
+
+<h3>Key Design Decisions</h3>
+
+<p><strong>Streaming Gzip Decompression:</strong> Logpush files are processed via <code>DecompressionStream</code> piped from the R2 object stream. The Worker decompresses and parses line-by-line, keeping memory constant regardless of file size. This is essential given the 128 MB Worker memory limit.</p>
+
+<p><strong>Idempotent Accumulative Writes:</strong> D1 writes use <code>INSERT ... ON CONFLICT DO UPDATE SET sum_bytes = sum_bytes + excluded.sum_bytes</code>. Multiple files covering the same minute accumulate correctly. If a file is retried, the <code>processed_files</code> status check prevents double-counting.</p>
+
+<p><strong>R2 Event Notification as Primary Trigger:</strong> Rather than polling R2 every N minutes, we rely on R2 Event Notifications for near-real-time processing. The Cron trigger (<code>*/10 * * * *</code>) serves only as a fallback — in case an Event Notification was missed.</p>
+
+<p><strong>Safe Lag Window:</strong> Files newer than <code>now - LAG_MINUTES</code> are skipped. This ensures that all Logpush files covering a given minute have been written to R2 before we start aggregating that minute. Without this, the last few minutes of data would be incomplete.</p>
+
+<!-- ── 3. Formula ── -->
+<h2 id="formula"><span class="num">3</span> Formula</h2>
+
+<p>Official Cloudflare formula for computing bytes served by the origin:</p>
+
+<pre><code>SUM(CacheResponseBytes)
+WHERE OriginResponseStatus NOT IN (0, 304)
+÷ 60 seconds × 8 bits = Mbps</code></pre>
+
+<p>Reference: <a href="https://developers.cloudflare.com/logs/faq/common-calculations/" target="_blank">developers.cloudflare.com/logs/faq/common-calculations</a></p>
+
+<table>
+  <thead><tr><th>OriginResponseStatus</th><th>Meaning</th><th>Included in bandwidth?</th></tr></thead>
+  <tbody>
+    <tr><td><code>0</code></td><td>HIT — CF served from cache, no request made to origin</td><td>❌ Excluded</td></tr>
+    <tr><td><code>304</code></td><td>Revalidated — origin confirmed no change, no body transferred</td><td>❌ Excluded</td></tr>
+    <tr><td><code>200</code>, <code>206</code></td><td>Origin served content (full or partial). Main source of origin bandwidth.</td><td>✅ Included</td></tr>
+    <tr><td><code>4xx</code>, <code>5xx</code></td><td>Origin error responses (included per official formula)</td><td>✅ Included</td></tr>
+  </tbody>
+</table>
+
+<p><strong>Time bucketing:</strong> uses <code>EdgeEndTimestamp</code> (the moment CF finishes sending the response to the client), consistent with the CF Analytics dashboard. For large file downloads that span multiple minutes, this correctly assigns the traffic to when it completed.</p>
+
+<!-- ── 4. Deployment ── -->
+<h2 id="deploy"><span class="num">4</span> Deployment</h2>
+
+<div class="note"><strong>Prerequisites:</strong> Node.js v18+, Wrangler CLI v3+ (<code>npm install -g wrangler</code>), a Cloudflare account with Workers Paid plan (required for D1 + Queues), and an existing Logpush job writing to R2.</div>
+
+<h3>Step 1 — Create D1 Database</h3>
+<pre><code>wrangler d1 create bw-stats</code></pre>
+<p>Copy the <code>database_id</code> from the output and paste it into <code>wrangler.toml</code>:</p>
+<pre><code>[[d1_databases]]
+binding       = "DB"
+database_name = "bw-stats"
+database_id   = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"   # ← paste here</code></pre>
+
+<h3>Step 2 — Initialize D1 Tables</h3>
+<pre><code>wrangler d1 execute bw-stats --file=./schema.sql --remote</code></pre>
+<p>Verify:</p>
+<pre><code>wrangler d1 execute bw-stats \
+  --command="SELECT name FROM sqlite_master WHERE type='table'" --remote</code></pre>
+<p>Expected output: <code>bw_stats</code> and <code>processed_files</code>.</p>
+
+<h3>Step 3 — Create Queues</h3>
+<pre><code>wrangler queues create bw-ingest-queue
+wrangler queues create bw-ingest-dlq</code></pre>
+
+<h3>Step 4 — Edit wrangler.toml</h3>
+<p>Open <code>wrangler.toml</code> and fill in your values:</p>
+<pre><code>[[r2_buckets]]
+binding     = "LOGPUSH_BUCKET"
+bucket_name = "your-logpush-bucket"   # ← your actual R2 bucket name
+
+[[d1_databases]]
+database_id = "xxxxxxxx-..."          # ← from Step 1
+
+[vars]
+LOG_PREFIX = "logs/"                  # ← Logpush path prefix (usually "logs/")
+START_TIME = "2026-04-01T00:00:00Z"   # ← only process files after this UTC time</code></pre>
+
+<h3>Step 5 — Configure R2 Event Notification</h3>
+<p>This is the primary trigger that enables near-real-time processing.</p>
+<ol>
+  <li>CF Dashboard → R2 → your Logpush bucket → <strong>Settings</strong> → <strong>Event Notifications</strong></li>
+  <li>Click <strong>Add notification</strong></li>
+  <li>Set: Event type = <code>object-create</code>, Queue = <code>bw-ingest-queue</code></li>
+  <li>Optional: Prefix = <code>logs/</code>, Suffix = <code>.gz</code></li>
+</ol>
+<div class="note"><strong>Important:</strong> Without R2 Event Notification, the Worker only runs on the 10-minute Cron schedule. Event Notification is strongly recommended for timely processing.</div>
+
+<h3>Step 6 — Set Dashboard Token (Optional)</h3>
+<pre><code># Leave empty to disable authentication (development only)
+# For production, set a strong random string:
+wrangler secret put DASHBOARD_TOKEN</code></pre>
+
+<h3>Step 7 — Deploy</h3>
+<pre><code>wrangler deploy</code></pre>
+<p>Expected output confirms: D1 binding, R2 binding, Queue producer/consumer, two Cron schedules.</p>
+
+<h3>Step 8 — Verify</h3>
+<pre><code># Check system status
+curl "https://origin-bw-monitor.&lt;subdomain&gt;.workers.dev/api/status"
+
+# Open dashboard
+# https://origin-bw-monitor.&lt;subdomain&gt;.workers.dev/?zone=example.com&hours=24</code></pre>
+
+<!-- ── 5. Configuration ── -->
+<h2 id="config"><span class="num">5</span> Configuration Reference</h2>
+
+<h3>wrangler.toml [vars]</h3>
+<table>
+  <thead><tr><th>Variable</th><th>Default</th><th>Required</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td><code>LOG_PREFIX</code></td><td><code>logs/</code></td><td><span class="badge badge-req">Required</span></td><td>Path prefix inside R2 for Logpush files. Must match your Logpush job configuration.</td></tr>
+    <tr><td><code>START_TIME</code></td><td><code>1970-01-01T00:00:00Z</code></td><td><span class="badge badge-req">Required</span></td><td>Only process R2 files written after this UTC timestamp. Set to your desired analysis start date to avoid processing months of historical data on first deploy.</td></tr>
+    <tr><td><code>LAG_MINUTES</code></td><td><code>10</code></td><td><span class="badge badge-opt">Optional</span></td><td>Safe Lag Window in minutes. Files newer than <code>now - LAG_MINUTES</code> are skipped to ensure all Logpush files for a given minute have landed in R2. Do not set below 5.</td></tr>
+    <tr><td><code>SCAN_BATCH_SIZE</code></td><td><code>20</code></td><td><span class="badge badge-opt">Optional</span></td><td>Max files to enqueue per Cron run. Prevents flooding the Queue during large historical imports via Cron. For manual imports, use <code>/api/import</code>.</td></tr>
+    <tr><td><code>MAX_PROCESSING_MIN</code></td><td><code>15</code></td><td><span class="badge badge-opt">Optional</span></td><td>If a file stays in <code>processing</code> status for longer than this (minutes), it is assumed the Worker crashed and the file is re-queued.</td></tr>
+    <tr><td><code>DATA_RETENTION_DAYS</code></td><td><code>7</code></td><td><span class="badge badge-opt">Optional</span></td><td>D1 data retention in days. Older data is deleted daily at UTC 02:00 by the cleanup Cron.</td></tr>
+    <tr><td><code>LOG_LEVEL</code></td><td><code>info</code></td><td><span class="badge badge-opt">Optional</span></td><td>Worker log verbosity: <code>debug</code> / <code>info</code> / <code>warn</code> / <code>error</code>. Use <code>debug</code> for troubleshooting; revert to <code>info</code> in production.</td></tr>
+    <tr><td><code>DASHBOARD_TOKEN</code></td><td><em>empty</em></td><td><span class="badge badge-opt">Optional</span></td><td>Access token for the Dashboard UI. Empty = no authentication (development only). Production: set via <code>wrangler secret put DASHBOARD_TOKEN</code>.</td></tr>
+  </tbody>
+</table>
+
+<h3>GitHub Actions CI/CD</h3>
+<p>The repo includes <code>.github/workflows/deploy.yml</code>. Any push to <code>main</code> triggers automatic deployment.</p>
+<p>Required GitHub secret: <code>CLOUDFLARE_API_TOKEN</code> (Workers Deploy permission).</p>
+
+<!-- ── 6. Import Historical Data ── -->
+<h2 id="import"><span class="num">6</span> Importing Historical Data</h2>
+
+<p>The Cron trigger processes new files as they arrive. To import historical files (e.g., the past 30 days), use the <code>/api/import</code> endpoint, which reads directly from R2 via the R2 Binding.</p>
+
+<h3>Basic Import (first page)</h3>
+<pre><code>curl -X POST "https://origin-bw-monitor.&lt;subdomain&gt;.workers.dev/api/import" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "from_time": "2026-04-01T00:00:00Z",
+    "page_size": 50
+  }'</code></pre>
+
+<h3>Paginated Import</h3>
+<p>If the response shows <code>"truncated": true</code>, continue with the returned <code>next_cursor</code>:</p>
+<pre><code>curl -X POST ".../api/import" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "from_time": "2026-04-01T00:00:00Z",
+    "page_size": 50,
+    "cursor": "&lt;next_cursor_from_previous_response&gt;"
+  }'</code></pre>
+<p>Repeat until <code>"truncated": false</code>. Recommend 30-second intervals between requests to avoid overwhelming the Queue.</p>
+
+<h3>Monitor Progress</h3>
+<pre><code>curl "https://origin-bw-monitor.&lt;subdomain&gt;.workers.dev/api/status"</code></pre>
+
+<p><strong>Throughput estimate:</strong> The Worker processes approximately 1 file per second (limited by R2 Binding read speed and CPU). For a large history import (e.g., 5,000 files), expect approximately 1–2 hours.</p>
+
+<!-- ── 7. Operations ── -->
+<h2 id="ops"><span class="num">7</span> Operations</h2>
+
+<h3>Health Check — Key Indicators</h3>
+<table>
+  <thead><tr><th>Indicator</th><th>Healthy State</th><th>Action if Abnormal</th></tr></thead>
+  <tbody>
+    <tr><td>R2 <code>logs/</code></td><td>New <code>.gz</code> files appearing every ~1 min</td><td>Check Logpush job is Enabled</td></tr>
+    <tr><td>Queue backlog</td><td>Near 0</td><td>Check Worker logs; look for errors</td></tr>
+    <tr><td>DLQ (<code>bw-ingest-dlq</code>)</td><td>0 messages</td><td>Messages present → check <code>/api/status</code> for failed files, then <code>/api/retry</code></td></tr>
+    <tr><td><code>/api/status</code> <code>failed</code></td><td>0</td><td>Call <code>POST /api/retry</code> to re-queue</td></tr>
+  </tbody>
+</table>
+
+<h3>API Endpoints</h3>
+<table>
+  <thead><tr><th>Endpoint</th><th>Method</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td><code>/</code></td><td>GET</td><td>Dashboard chart UI</td></tr>
+    <tr><td><code>/api/stats?zone=&amp;hours=</code></td><td>GET</td><td>Bandwidth data as JSON</td></tr>
+    <tr><td><code>/api/import</code></td><td>POST</td><td>Manually enqueue R2 files for processing (paginated)</td></tr>
+    <tr><td><code>/api/status</code></td><td>GET</td><td>System status: file counts, data range, config</td></tr>
+    <tr><td><code>/api/retry</code></td><td>POST</td><td>Re-queue up to 50 failed files</td></tr>
+  </tbody>
+</table>
+
+<h3>Tail Worker Logs</h3>
+<pre><code>wrangler tail origin-bw-monitor</code></pre>
+<p>Expected log output:</p>
+<pre><code>[INFO] Processing: logs/20260414/20260414T100000Z_abc.log.gz
+[INFO] Done: logs/20260414/... | lines=87234 lag=0 filter=83891 err=0 minutes=11</code></pre>
+
+<h3>Reset and Re-import</h3>
+<pre><code># Clear all data and start fresh
+wrangler d1 execute bw-stats \
+  --command="DELETE FROM bw_stats; DELETE FROM processed_files;" \
+  --remote
+
+# Then re-import using /api/import as described in Section 6</code></pre>
+
+</div>
+
+<div class="footer">
+  Cloudflare Workers + R2 + Queues + D1 · Origin Bandwidth Monitoring · 2026<br>
+  <a href="https://github.com/CFChinaNetwork/origin-bw-monitor" target="_blank">github.com/CFChinaNetwork/origin-bw-monitor</a>
+</div>
+
+</body>
+</html>

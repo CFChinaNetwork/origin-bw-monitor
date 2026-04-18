@@ -17,6 +17,13 @@ invocation_logs = true
 [triggers]
 crons = ["*/10 * * * *", "0 2 * * *"]
 
+# ── R2 存储桶（Logpush 写入的同一个桶，直接 binding）─────────
+# binding = "LOGPUSH_BUCKET" 不要修改，index.js 通过此名称访问
+# bucket_name 改为你的 Logpush R2 桶名
+[[r2_buckets]]
+binding     = "LOGPUSH_BUCKET"
+bucket_name = "your-logpush-bucket"   # ← 替换为实际 R2 桶名
+
 # ── D1 数据库 ─────────────────────────────────────────────────
 # 先执行 `wrangler d1 create bw-stats` 获取 database_id，填入下方
 [[d1_databases]]
@@ -49,22 +56,15 @@ cpu_ms = 300000   # Queue Consumer 最大 CPU 时间：5分钟
 # 日志级别：debug / info / warn / error
 LOG_LEVEL = "info"
 
-# ── 数据源：目标客户 R2 Bucket ─────────────────────────────────
-# 填写需要分析的客户 Cloudflare Account ID
-# 获取方式：CF Dashboard 右上角 → 点击账号名 → 复制 Account ID
-CUSTOMER_ACCOUNT_ID = "YOUR_CUSTOMER_ACCOUNT_ID"   # ← 替换
-
-# 客户 R2 Bucket 名称（Logpush 写入的桶）
-CUSTOMER_BUCKET = "YOUR_LOGPUSH_BUCKET_NAME"       # ← 替换
-
-# Logpush 写入 R2 的路径前缀（默认格式：logs/YYYYMMDD/文件名.log.gz）
+# ── Logpush 日志路径前缀 ───────────────────────────────────────
+# 默认 Logpush 写入格式：logs/YYYYMMDD/文件名.log.gz
 LOG_PREFIX = "logs/"
 
 # ── 时间控制 ──────────────────────────────────────────────────
 # 只处理此 UTC 时间点之后写入 R2 的文件
 # 用途：避免处理海量历史数据，从指定时间点开始出图
 # 格式：ISO 8601 UTC，例如 "2026-04-14T00:00:00Z"
-START_TIME = "2026-04-14T00:00:00Z"                # ← 按需修改
+START_TIME = "2026-04-01T00:00:00Z"   # ← 按需修改为你的起始分析日期
 
 # Safe Lag Window（分钟）
 # 只处理当前时间减去此值之前的文件，确保 Logpush 文件已全部落盘
@@ -74,10 +74,6 @@ LAG_MINUTES = "10"
 # ── 流控配置 ──────────────────────────────────────────────────
 # Cron 每次最多扫描并入队多少个文件（防瞬间大量文件涌入）
 SCAN_BATCH_SIZE = "20"
-
-# CF REST API 调用间隔（毫秒）
-# CF API Rate Limit：1200次/5分钟 = 4 req/s，300ms ≈ 3.3 req/s
-RATE_LIMIT_DELAY_MS = "300"
 
 # processing 状态超时阈值（分钟），超时则认为 Worker 已崩溃，允许重试
 MAX_PROCESSING_MIN = "15"
@@ -91,14 +87,13 @@ DATA_RETENTION_DAYS = "7"
 # 生产环境强烈建议用 secret 设置：wrangler secret put DASHBOARD_TOKEN
 DASHBOARD_TOKEN = ""
 
+workers_dev  = false
+preview_urls = false
+
 # ── Secrets（敏感信息，不写在此文件，用命令行单独设置）───────────
-# 执行以下命令设置：
+# 仅需设置 Dashboard 访问鉴权（可选）：
 #
-#   wrangler secret put CF_API_TOKEN
-#   （填写有权限读取目标 R2 Bucket 的 Cloudflare API Token）
+#   wrangler secret put DASHBOARD_TOKEN
 #
-# API Token 所需权限：
-#   - Account > R2 Storage > Read（读取 Logpush 日志文件）
-#   - 如果 R2 所在账号与部署 Worker 的账号不同，需要跨账号 Token
-#
-# 获取方式：CF Dashboard → My Profile → API Tokens → Create Token
+# 注意：使用 R2 Binding 方式，不需要任何 API Key 或 Token 来访问 R2。
+# R2 访问权限由 [[r2_buckets]] binding 自动授权，无需额外密钥。

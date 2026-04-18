@@ -1,0 +1,395 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CF 回源带宽监控工具 — 部署与使用指南</title>
+<style>
+  :root {
+    --orange: #f6821f; --dark: #1a1a2e; --bg: #f8f9fa; --white: #fff;
+    --border: #e0e0e8; --code-bg: #f0f0f4; --text: #333; --muted: #666;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, 'PingFang SC', 'Microsoft YaHei', sans-serif;
+         font-size: 14px; line-height: 1.7; color: var(--text); background: var(--bg); }
+  .header { background: var(--dark); color: #fff; padding: 32px 48px; }
+  .header h1 { font-size: 24px; font-weight: 800; color: var(--orange); margin-bottom: 4px; }
+  .header .sub { font-size: 12px; color: #888; letter-spacing: 0.5px; }
+  nav { background: var(--dark); border-top: 1px solid #2a2a3e; padding: 10px 48px;
+        display: flex; gap: 24px; font-size: 12px; flex-wrap: wrap; }
+  nav a { color: #aaa; text-decoration: none; } nav a:hover { color: var(--orange); }
+  .main { max-width: 960px; margin: 0 auto; padding: 40px 48px; }
+  h2 { font-size: 18px; font-weight: 800; padding: 10px 16px;
+       background: var(--dark); color: #fff; border-radius: 5px; margin: 40px 0 16px; }
+  h2 .num { background: var(--orange); color: #000; padding: 2px 8px; border-radius: 3px;
+            font-size: 12px; margin-right: 8px; }
+  h3 { font-size: 14px; font-weight: 700; color: var(--dark); margin: 20px 0 8px;
+       padding-left: 10px; border-left: 3px solid var(--orange); }
+  p { margin-bottom: 10px; }
+  ul, ol { margin: 8px 0 12px 24px; }
+  li { margin-bottom: 4px; }
+  code { background: var(--code-bg); padding: 1px 6px; border-radius: 3px;
+         font-family: 'Courier New', monospace; font-size: 12px; color: #c0392b; }
+  pre { background: var(--dark); color: #e0e0e0; padding: 16px 20px; border-radius: 6px;
+        overflow-x: auto; font-size: 12.5px; line-height: 1.6; margin: 10px 0 16px; }
+  pre code { background: none; color: inherit; padding: 0; font-size: inherit; }
+  table { width: 100%; border-collapse: collapse; margin: 10px 0 18px; font-size: 13px; }
+  thead tr { background: var(--dark); color: #fff; }
+  thead th { padding: 9px 12px; text-align: left; font-weight: 600; }
+  tbody tr:nth-child(even) { background: #f7f8fc; }
+  tbody td { padding: 8px 12px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 3px; font-size: 11px; font-weight: 700; }
+  .badge-req { background: #fde8d8; color: #b94a00; border: 1px solid #f6c5a0; }
+  .badge-opt { background: #e6f4ea; color: #1e7e34; border: 1px solid #b7dfbf; }
+  .arch-box { background: var(--dark); color: #e0e0e0; border-radius: 8px; padding: 24px;
+              font-family: 'Courier New', monospace; font-size: 12.5px; line-height: 1.8;
+              overflow-x: auto; margin: 16px 0; }
+  .arch-box .step { color: var(--orange); font-weight: 700; }
+  .arch-box .comment { color: #888; }
+  .note { background: #fff8f2; border-left: 4px solid var(--orange); padding: 10px 16px;
+          border-radius: 0 4px 4px 0; margin: 12px 0; font-size: 13px; }
+  .note strong { color: var(--orange); }
+  .footer { text-align: center; font-size: 11px; color: #aaa; padding: 32px;
+            border-top: 1px solid var(--border); }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="sub">Cloudflare Workers + R2 + Queues + D1 · 回源带宽监控</div>
+  <h1>CF 回源带宽监控工具</h1>
+  <div class="sub">部署与使用指南</div>
+</div>
+
+<nav>
+  <a href="#overview">概述</a>
+  <a href="#architecture">架构</a>
+  <a href="#formula">计算公式</a>
+  <a href="#deploy">部署步骤</a>
+  <a href="#config">配置说明</a>
+  <a href="#import">历史数据导入</a>
+  <a href="#ops">运维管理</a>
+</nav>
+
+<div class="main">
+
+<!-- ── 1. 概述 ── -->
+<h2 id="overview"><span class="num">1</span> 概述</h2>
+
+<p>本工具部署在<strong>您自己的 Cloudflare 账号</strong>下，通过读取您现有的 Logpush R2 日志，使用官方公式计算每分钟的回源带宽，并以图表形式展示。</p>
+
+<table>
+  <thead><tr><th>项目</th><th>说明</th></tr></thead>
+  <tbody>
+    <tr><td><strong>用途</strong></td><td>可视化您的源站需要向 Cloudflare 提供多少带宽（即缓存未命中流量）</td></tr>
+    <tr><td><strong>技术栈</strong></td><td>100% Cloudflare 原生：Logpush + R2 + Queues + Workers + D1，零服务器维护</td></tr>
+    <tr><td><strong>部署位置</strong></td><td>部署在<strong>您自己的 Cloudflare 账号</strong>下——无跨账号访问，无外部服务器</td></tr>
+    <tr><td><strong>R2 访问方式</strong></td><td>通过 R2 Binding 只读访问，<strong>绝不向您的 R2 写入任何数据</strong></td></tr>
+    <tr><td><strong>数据保留</strong></td><td>7天（可配置），每日 UTC 02:00 自动清理</td></tr>
+    <tr><td><strong>图表延迟</strong></td><td>约 20 分钟（安全窗口 + Cron 间隔）</td></tr>
+  </tbody>
+</table>
+
+<h3>使用的 Cloudflare 服务</h3>
+<table>
+  <thead><tr><th>服务</th><th>职责</th><th>Dashboard 位置</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Logpush</strong></td><td>已在运行——每约1分钟将 HTTP 请求日志导出到 R2</td><td>域名 → Analytics &amp; Logs → Logpush</td></tr>
+    <tr><td><strong>R2 对象存储</strong></td><td>存储 Logpush 文件。本工具通过 R2 Binding 只读这些文件，不写入</td><td>Dashboard → R2</td></tr>
+    <tr><td><strong>R2 Event Notifications</strong></td><td>每当 Logpush 写入新文件时，立即触发 Queue 消息——实现近实时处理</td><td>R2 桶 → Settings → Event Notifications</td></tr>
+    <tr><td><strong>Queues</strong></td><td>解耦 R2 事件检测与文件处理；提供至少一次投递保证和自动重试</td><td>Dashboard → Workers &amp; Pages → Queues</td></tr>
+    <tr><td><strong>Workers</strong></td><td>一个脚本处理：Cron 扫描、Queue 消费（流式解析+写D1）、Dashboard HTTP</td><td>通过 <code>wrangler deploy</code> 部署</td></tr>
+    <tr><td><strong>D1（SQLite）</strong></td><td>存储分钟级带宽聚合数据，7天保留，自动清理</td><td>Dashboard → Workers &amp; Pages → D1</td></tr>
+  </tbody>
+</table>
+
+<!-- ── 2. 架构 ── -->
+<h2 id="architecture"><span class="num">2</span> 架构</h2>
+
+<div class="arch-box">
+<span class="comment">┌─────────────────────────────────────────────────────────────────────────────┐</span>
+<span class="comment">│  [已在运行] 您现有的 Logpush 任务                                           │</span>
+<span class="comment">│                                                                             │</span>
+<span class="comment">│  CF 边缘节点处理每一个 HTTP 请求，在内部缓冲访问日志                       │</span>
+<span class="comment">│  每约1分钟，Logpush 自动完成以下操作：                                     │</span>
+<span class="comment">│    1. 将过去约60秒的所有日志打包为一个 .log.gz 文件（ndjson 格式）         │</span>
+<span class="comment">│    2. 写入您的 R2 桶                                                       │</span>
+<span class="comment">│                                                                             │</span>
+<span class="comment">│  R2 桶：your-logpush-bucket/                                                │</span>
+<span class="comment">│    └── logs/                                                                │</span>
+<span class="comment">│          └── 20260414/                                                      │</span>
+<span class="comment">│                ├── 20260414T100000Z_abc123.log.gz   ← 每个文件10~150 MB    │</span>
+<span class="comment">│                ├── 20260414T100100Z_def456.log.gz   ← 约每分钟新增一个文件 │</span>
+<span class="comment">│                └── ...                                                      │</span>
+<span class="comment">└───────────────────────────────────────┬─────────────────────────────────────┘</span>
+                                        │
+                <span class="step">[步骤1]</span> R2 检测到新对象 → 触发 Event Notification（2~5秒）
+                                        │
+                                        ▼
+<span class="comment">┌─────────────────────────────────────────────────────────────────────────────┐</span>
+<span class="comment">│  bw-ingest-queue                                                            │</span>
+<span class="comment">│                                                                             │</span>
+<span class="comment">│  消息内容：{ "key": "logs/20260414/20260414T100000Z_abc123.log.gz" }        │</span>
+<span class="comment">│  （Queue 消息只携带 R2 对象的 key，仅几十字节，远低于 128 KB 限制）        │</span>
+<span class="comment">└───────────────────────────────────────┬─────────────────────────────────────┘</span>
+                                        │
+                <span class="step">[步骤2]</span> Queue 唤醒 Worker（3~15秒，max_batch_size=3）
+                                        │
+                                        ▼
+<span class="comment">┌─────────────────────────────────────────────────────────────────────────────┐</span>
+<span class="comment">│  Queue Consumer Worker — 流式解析 + 聚合                                   │</span>
+<span class="comment">│                                                                             │</span>
+<span class="comment">│  ① env.LOGPUSH_BUCKET.get(key)                                             │</span>
+<span class="comment">│       通过 R2 Binding 读取文件，只读，无需 API Key                         │</span>
+<span class="comment">│                                                                             │</span>
+<span class="comment">│  ② obj.body.pipeThrough(new DecompressionStream('gzip'))                   │</span>
+<span class="comment">│       流式解压——内存中始终只有几行数据，无论文件多大都不会 OOM              │</span>
+<span class="comment">│       （Worker 内存上限 128 MB）                                            │</span>
+<span class="comment">│                                                                             │</span>
+<span class="comment">│  ③ 逐行处理：JSON.parse → 应用官方公式                                     │</span>
+<span class="comment">│       if OriginResponseStatus == 0:   跳过（HIT，未回源）                  │</span>
+<span class="comment">│       if OriginResponseStatus == 304: 跳过（revalidated，无 body 传输）    │</span>
+<span class="comment">│       else: sum += CacheResponseBytes  ← 计入回源带宽                      │</span>
+<span class="comment">│                                                                             │</span>
+<span class="comment">│  ④ 按 EdgeEndTimestamp（请求结束时间）分桶到 UTC 自然分钟                  │</span>
+<span class="comment">│       key = "2026-04-14T03:01|example.com"                                  │</span>
+<span class="comment">│       value = { sum: 这一分钟的总字节数 }                                   │</span>
+<span class="comment">└───────────────────────────────────────┬─────────────────────────────────────┘</span>
+                                        │
+                <span class="step">[步骤3]</span> 批量累加写入 D1（幂等，支持多文件写同一分钟）
+                                        │
+                                        ▼
+<span class="comment">┌─────────────────────────────────────────────────────────────────────────────┐</span>
+<span class="comment">│  D1 数据库 — bw_stats 表                                                    │</span>
+<span class="comment">│                                                                             │</span>
+<span class="comment">│  minute_utc          zone                sum_bytes                          │</span>
+<span class="comment">│  ─────────────────── ──────────────────  ─────────                          │</span>
+<span class="comment">│  2026-04-14T03:01    example.com         2,974,063,359   ← 该分钟总字节数  │</span>
+<span class="comment">│  2026-04-14T03:02    example.com         1,815,429,212                       │</span>
+<span class="comment">│  ...                                                                        │</span>
+<span class="comment">│                                                                             │</span>
+<span class="comment">│  Mbps = sum_bytes / 60秒 × 8bits / 1024²                                    │</span>
+<span class="comment">│  数据保留：7天，每日 UTC 02:00 自动清理                                    │</span>
+<span class="comment">└───────────────────────────────────────┬─────────────────────────────────────┘</span>
+                                        │
+                <span class="step">[步骤4]</span> Dashboard Worker 提供 HTTP 图表服务
+                                        │
+                                        ▼
+<span class="comment">┌─────────────────────────────────────────────────────────────────────────────┐</span>
+<span class="comment">│  Dashboard                                                                  │</span>
+<span class="comment">│                                                                             │</span>
+<span class="comment">│  浏览器 → GET / → Worker 查询 D1 → Chart.js 渲染带宽曲线图                │</span>
+<span class="comment">│  访问地址：https://origin-bw-monitor.&lt;子域名&gt;.workers.dev/                │</span>
+<span class="comment">│             ?zone=example.com&amp;hours=24                                      │</span>
+<span class="comment">└─────────────────────────────────────────────────────────────────────────────┘</span>
+</div>
+
+<h3>触发机制与延迟</h3>
+<table>
+  <thead><tr><th>阶段</th><th>触发方式</th><th>延迟</th></tr></thead>
+  <tbody>
+    <tr><td>Logpush → R2</td><td>时间驱动，约60秒间隔（CF 内部）</td><td>整个链路唯一的"时钟"</td></tr>
+    <tr><td>R2 → Queue</td><td>事件驱动：R2 Event Notification 在每次新文件写入时立即触发</td><td>R2 写入后 2~5 秒</td></tr>
+    <tr><td>Queue → Worker</td><td>事件驱动：满足 <code>max_batch_size=3</code> 或 <code>max_batch_timeout=30s</code> 时触发</td><td>3~15 秒</td></tr>
+    <tr><td>Worker → D1</td><td>在同一次 Worker 调用内完成</td><td>毫秒级</td></tr>
+    <tr><td>链路总延迟</td><td>Logpush(~60s) + Event(~5s) + Queue(~15s) + 处理(~30s)</td><td><strong>约 2 分钟</strong></td></tr>
+    <tr><td>Safe Lag Window</td><td>额外等待，确保该分钟所有文件都已落盘</td><td><strong>+10 分钟</strong></td></tr>
+    <tr><td><strong>图表数据延迟</strong></td><td>从请求发生到图表可见的总延迟</td><td><strong>约 12~20 分钟</strong></td></tr>
+  </tbody>
+</table>
+
+<h3>关键设计决策</h3>
+
+<p><strong>流式 Gzip 解压：</strong>Logpush 文件通过 <code>DecompressionStream</code> 从 R2 对象流中逐行解压处理，内存中始终只保存当前几行数据。无论文件多大（10 MB ~ 150 MB），内存占用保持恒定，不会触发 128 MB Worker 内存限制。</p>
+
+<p><strong>幂等累加写入：</strong>D1 写入使用 <code>INSERT ... ON CONFLICT DO UPDATE SET sum_bytes = sum_bytes + excluded.sum_bytes</code>。同一分钟内来自多个文件的数据会被正确累加。如果文件被重试，<code>processed_files</code> 状态检查会防止重复计算。</p>
+
+<p><strong>R2 Event Notification 为主要触发器：</strong>无需每 N 分钟轮询 R2，R2 Event Notification 实现近实时处理。Cron 触发器（每10分钟）仅作为兜底保障——应对偶尔遗漏的 Event Notification。</p>
+
+<p><strong>Safe Lag Window（安全延迟窗口）：</strong>跳过 <code>now - LAG_MINUTES</code> 之后写入的文件，确保某一分钟内的所有 Logpush 文件都已落盘再开始聚合，避免统计结果不完整。</p>
+
+<!-- ── 3. 计算公式 ── -->
+<h2 id="formula"><span class="num">3</span> 计算公式</h2>
+
+<p>官方 Cloudflare 回源带宽计算公式：</p>
+<pre><code>SUM(CacheResponseBytes)
+WHERE OriginResponseStatus NOT IN (0, 304)
+÷ 60 秒 × 8 bits = Mbps</code></pre>
+
+<p>参考：<a href="https://developers.cloudflare.com/logs/faq/common-calculations/" target="_blank">developers.cloudflare.com/logs/faq/common-calculations</a></p>
+
+<table>
+  <thead><tr><th>OriginResponseStatus</th><th>含义</th><th>是否计入带宽</th></tr></thead>
+  <tbody>
+    <tr><td><code>0</code></td><td>HIT — CF 从缓存返回，未联系源站</td><td>❌ 排除</td></tr>
+    <tr><td><code>304</code></td><td>Revalidated — 源站确认未变更，无 body 传输</td><td>❌ 排除</td></tr>
+    <tr><td><code>200</code>、<code>206</code></td><td>源站返回了内容（完整或分片），是回源带宽的主要来源</td><td>✅ 计入</td></tr>
+    <tr><td><code>4xx</code>、<code>5xx</code></td><td>源站错误响应（依官方公式，计入带宽）</td><td>✅ 计入</td></tr>
+  </tbody>
+</table>
+
+<p><strong>时间分桶：</strong>使用 <code>EdgeEndTimestamp</code>（请求结束时间），与 CF Analytics 控制台统计口径一致。对于持续数秒甚至数分钟的大文件下载，按结束时间归入分钟更为准确。</p>
+
+<!-- ── 4. 部署步骤 ── -->
+<h2 id="deploy"><span class="num">4</span> 部署步骤</h2>
+
+<div class="note"><strong>前置条件：</strong>Node.js v18+，Wrangler CLI v3+（<code>npm install -g wrangler</code>），Cloudflare Workers Paid 计划（D1 和 Queues 需要付费计划），以及已配置并运行中的 Logpush 任务（正在向 R2 写入日志）。</div>
+
+<h3>步骤1 — 创建 D1 数据库</h3>
+<pre><code>wrangler d1 create bw-stats</code></pre>
+<p>将输出中的 <code>database_id</code> 复制并填入 <code>wrangler.toml</code>：</p>
+<pre><code>[[d1_databases]]
+binding       = "DB"
+database_name = "bw-stats"
+database_id   = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"   # ← 粘贴到这里</code></pre>
+
+<h3>步骤2 — 初始化 D1 表结构</h3>
+<pre><code>wrangler d1 execute bw-stats --file=./schema.sql --remote</code></pre>
+<p>验证是否成功：</p>
+<pre><code>wrangler d1 execute bw-stats \
+  --command="SELECT name FROM sqlite_master WHERE type='table'" --remote</code></pre>
+<p>应看到 <code>bw_stats</code> 和 <code>processed_files</code> 两张表。</p>
+
+<h3>步骤3 — 创建 Queue</h3>
+<pre><code>wrangler queues create bw-ingest-queue
+wrangler queues create bw-ingest-dlq</code></pre>
+
+<h3>步骤4 — 修改 wrangler.toml</h3>
+<p>打开 <code>wrangler.toml</code>，填入您的实际配置：</p>
+<pre><code>[[r2_buckets]]
+binding     = "LOGPUSH_BUCKET"
+bucket_name = "your-logpush-bucket"   # ← 您的实际 R2 桶名
+
+[[d1_databases]]
+database_id = "xxxxxxxx-..."          # ← 步骤1中获取的 ID
+
+[vars]
+LOG_PREFIX = "logs/"                  # ← Logpush 写入路径前缀（通常是 "logs/"）
+START_TIME = "2026-04-01T00:00:00Z"   # ← 只处理此时间点之后的文件（UTC）</code></pre>
+
+<h3>步骤5 — 配置 R2 Event Notification（强烈推荐）</h3>
+<p>这是实现近实时处理的核心配置：</p>
+<ol>
+  <li>CF Dashboard → R2 → 您的 Logpush 桶 → <strong>Settings</strong> → <strong>Event Notifications</strong></li>
+  <li>点击 <strong>Add notification</strong></li>
+  <li>设置：Event type = <code>object-create</code>，Queue = <code>bw-ingest-queue</code></li>
+  <li>可选：Prefix = <code>logs/</code>，Suffix = <code>.gz</code>（只触发 Logpush 文件）</li>
+</ol>
+<div class="note"><strong>重要：</strong>不配置 R2 Event Notification 时，Worker 仅在每10分钟的 Cron 时触发。强烈建议配置 Event Notification 以实现及时处理。</div>
+
+<h3>步骤6 — 设置 Dashboard 鉴权 Token（可选）</h3>
+<pre><code># 留空 = 不鉴权（仅本地开发）
+# 生产环境建议设置一个随机字符串：
+wrangler secret put DASHBOARD_TOKEN</code></pre>
+
+<h3>步骤7 — 部署</h3>
+<pre><code>wrangler deploy</code></pre>
+<p>输出应显示：D1 binding、R2 binding、Queue 生产者/消费者、两个 Cron 调度。</p>
+
+<h3>步骤8 — 验证</h3>
+<pre><code># 查看系统状态
+curl "https://origin-bw-monitor.&lt;子域名&gt;.workers.dev/api/status"
+
+# 打开图表
+# https://origin-bw-monitor.&lt;子域名&gt;.workers.dev/?zone=example.com&hours=24</code></pre>
+
+<!-- ── 5. 配置说明 ── -->
+<h2 id="config"><span class="num">5</span> 配置说明</h2>
+
+<h3>wrangler.toml [vars] 参数</h3>
+<table>
+  <thead><tr><th>变量名</th><th>默认值</th><th>是否必填</th><th>说明</th></tr></thead>
+  <tbody>
+    <tr><td><code>LOG_PREFIX</code></td><td><code>logs/</code></td><td><span class="badge badge-req">必填</span></td><td>R2 桶内 Logpush 文件的路径前缀，必须与您的 Logpush 任务配置一致。</td></tr>
+    <tr><td><code>START_TIME</code></td><td><code>1970-01-01T00:00:00Z</code></td><td><span class="badge badge-req">必填</span></td><td>只处理此 UTC 时间点之后写入 R2 的文件。首次部署时建议设置为近期日期，避免处理数月的历史数据。</td></tr>
+    <tr><td><code>LAG_MINUTES</code></td><td><code>10</code></td><td><span class="badge badge-opt">可选</span></td><td>安全延迟窗口（分钟）。跳过 <code>now - LAG_MINUTES</code> 之后的文件，确保该分钟内所有 Logpush 文件已落盘。建议不低于 5 分钟。</td></tr>
+    <tr><td><code>SCAN_BATCH_SIZE</code></td><td><code>20</code></td><td><span class="badge badge-opt">可选</span></td><td>Cron 每次最多入队的文件数量。防止大量历史文件一次性涌入 Queue。手动导入历史数据请使用 <code>/api/import</code>。</td></tr>
+    <tr><td><code>MAX_PROCESSING_MIN</code></td><td><code>15</code></td><td><span class="badge badge-opt">可选</span></td><td>处理超时阈值（分钟）。如果一个文件在 <code>processing</code> 状态超过此时长，认为 Worker 已崩溃，文件将被重新入队。</td></tr>
+    <tr><td><code>DATA_RETENTION_DAYS</code></td><td><code>7</code></td><td><span class="badge badge-opt">可选</span></td><td>D1 数据保留天数。超过此天数的数据每日 UTC 02:00 自动删除。</td></tr>
+    <tr><td><code>LOG_LEVEL</code></td><td><code>info</code></td><td><span class="badge badge-opt">可选</span></td><td>日志级别：<code>debug</code> / <code>info</code> / <code>warn</code> / <code>error</code>。排查问题时使用 <code>debug</code>，生产环境恢复为 <code>info</code>。</td></tr>
+    <tr><td><code>DASHBOARD_TOKEN</code></td><td><em>空</em></td><td><span class="badge badge-opt">可选</span></td><td>Dashboard 访问鉴权 Token。空 = 不鉴权（仅开发用）。生产环境通过 <code>wrangler secret put DASHBOARD_TOKEN</code> 设置。</td></tr>
+  </tbody>
+</table>
+
+<h3>GitHub Actions 自动部署</h3>
+<p>仓库包含 <code>.github/workflows/deploy.yml</code>，推送到 <code>main</code> 分支自动触发部署。</p>
+<p>需在 GitHub 仓库 Settings → Secrets 中设置：<code>CLOUDFLARE_API_TOKEN</code>（Workers Deploy 权限）。</p>
+
+<!-- ── 6. 历史数据导入 ── -->
+<h2 id="import"><span class="num">6</span> 历史数据导入</h2>
+
+<p>Cron 触发器负责自动处理新文件。如需导入历史文件（如过去30天的数据），使用 <code>/api/import</code> 接口，该接口通过 R2 Binding 直接读取 R2 文件。</p>
+
+<h3>基本导入（第一页）</h3>
+<pre><code>curl -X POST "https://origin-bw-monitor.&lt;子域名&gt;.workers.dev/api/import" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "from_time": "2026-04-01T00:00:00Z",
+    "page_size": 50
+  }'</code></pre>
+
+<h3>分页导入</h3>
+<p>如果响应中 <code>"truncated": true</code>，用返回的 <code>next_cursor</code> 继续：</p>
+<pre><code>curl -X POST ".../api/import" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "from_time": "2026-04-01T00:00:00Z",
+    "page_size": 50,
+    "cursor": "&lt;上一次响应中的 next_cursor&gt;"
+  }'</code></pre>
+<p>重复执行直到 <code>"truncated": false</code>。建议每次请求间隔 30 秒以上，避免 Queue 过载。</p>
+
+<h3>查看导入进度</h3>
+<pre><code>curl "https://origin-bw-monitor.&lt;子域名&gt;.workers.dev/api/status"</code></pre>
+
+<p><strong>吞吐量估算：</strong>Worker 每秒处理约 1 个文件（受 R2 Binding 读取速度和 CPU 限制）。大批量历史导入（如5000个文件）约需 1~2 小时。</p>
+
+<!-- ── 7. 运维管理 ── -->
+<h2 id="ops"><span class="num">7</span> 运维管理</h2>
+
+<h3>健康检查指标</h3>
+<table>
+  <thead><tr><th>指标</th><th>健康状态</th><th>异常时处理</th></tr></thead>
+  <tbody>
+    <tr><td>R2 <code>logs/</code></td><td>每约1分钟有新 <code>.gz</code> 文件</td><td>检查 Logpush 任务是否已启用</td></tr>
+    <tr><td>Queue 积压</td><td>接近 0</td><td>查看 Worker 日志，排查错误</td></tr>
+    <tr><td>死信队列（<code>bw-ingest-dlq</code>）</td><td>0 条消息</td><td>有消息 → 查看 <code>/api/status</code> 中的失败文件，调用 <code>/api/retry</code></td></tr>
+    <tr><td><code>/api/status</code> <code>failed</code> 数</td><td>0</td><td>调用 <code>POST /api/retry</code> 重新入队</td></tr>
+  </tbody>
+</table>
+
+<h3>API 接口</h3>
+<table>
+  <thead><tr><th>接口</th><th>方法</th><th>说明</th></tr></thead>
+  <tbody>
+    <tr><td><code>/</code></td><td>GET</td><td>Dashboard 图表页面</td></tr>
+    <tr><td><code>/api/stats?zone=&amp;hours=</code></td><td>GET</td><td>带宽数据 JSON</td></tr>
+    <tr><td><code>/api/import</code></td><td>POST</td><td>手动分页导入 R2 历史文件</td></tr>
+    <tr><td><code>/api/status</code></td><td>GET</td><td>系统状态：文件处理计数、数据范围、配置</td></tr>
+    <tr><td><code>/api/retry</code></td><td>POST</td><td>重新入队最多50个失败文件</td></tr>
+  </tbody>
+</table>
+
+<h3>实时查看 Worker 日志</h3>
+<pre><code>wrangler tail origin-bw-monitor</code></pre>
+<p>正常日志示例：</p>
+<pre><code>[INFO] Processing: logs/20260414/20260414T100000Z_abc.log.gz
+[INFO] Done: logs/20260414/... | lines=87234 lag=0 filter=83891 err=0 minutes=11</code></pre>
+
+<h3>重置并重新导入</h3>
+<pre><code># 清空所有数据，重新开始
+wrangler d1 execute bw-stats \
+  --command="DELETE FROM bw_stats; DELETE FROM processed_files;" \
+  --remote
+
+# 然后通过 /api/import 重新导入（参见第6章）</code></pre>
+
+</div>
+
+<div class="footer">
+  Cloudflare Workers + R2 + Queues + D1 · 回源带宽监控 · 2026<br>
+  <a href="https://github.com/CFChinaNetwork/origin-bw-monitor" target="_blank">github.com/CFChinaNetwork/origin-bw-monitor</a>
+</div>
+
+</body>
+</html>
