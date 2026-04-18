@@ -1,0 +1,104 @@
+name = "origin-bw-monitor"
+main = "src/index.js"
+compatibility_date = "2026-04-01"
+compatibility_flags = ["nodejs_compat"]
+
+# account_id 不写在这里，由 CLOUDFLARE_API_TOKEN 环境变量或 wrangler login 决定
+
+# ── Observability ─────────────────────────────────────────────
+[observability]
+[observability.logs]
+enabled         = true
+invocation_logs = true
+
+# ── Cron 调度 ─────────────────────────────────────────────────
+# cron 1：每10分钟扫描 R2 新文件并入队处理
+# cron 2：每天 UTC 02:00 执行 D1 数据生命周期清理
+[triggers]
+crons = ["*/10 * * * *", "0 2 * * *"]
+
+# ── D1 数据库 ─────────────────────────────────────────────────
+# 先执行 `wrangler d1 create bw-stats` 获取 database_id，填入下方
+[[d1_databases]]
+binding       = "DB"
+database_name = "bw-stats"
+database_id   = "YOUR_D1_DATABASE_ID"   # ← 替换为 wrangler d1 create 输出的 ID
+
+# ── Queue 生产者 ──────────────────────────────────────────────
+[[queues.producers]]
+binding = "INGEST_QUEUE"
+queue   = "bw-ingest-queue"
+
+# ── Queue 消费者（保守串行配置）──────────────────────────────
+[[queues.consumers]]
+queue             = "bw-ingest-queue"
+max_batch_size    = 3       # 每批最多3个文件，控制内存压力
+max_batch_timeout = 30
+max_retries       = 3
+dead_letter_queue = "bw-ingest-dlq"
+
+# ── Worker 资源限制 ───────────────────────────────────────────
+[limits]
+cpu_ms = 300000   # Queue Consumer 最大 CPU 时间：5分钟
+
+# ── 业务配置变量 ───────────────────────────────────────────────
+# 所有变量集中在此，index.js 永远不需要修改
+
+[vars]
+
+# 日志级别：debug / info / warn / error
+LOG_LEVEL = "info"
+
+# ── 数据源：目标客户 R2 Bucket ─────────────────────────────────
+# 填写需要分析的客户 Cloudflare Account ID
+# 获取方式：CF Dashboard 右上角 → 点击账号名 → 复制 Account ID
+CUSTOMER_ACCOUNT_ID = "YOUR_CUSTOMER_ACCOUNT_ID"   # ← 替换
+
+# 客户 R2 Bucket 名称（Logpush 写入的桶）
+CUSTOMER_BUCKET = "YOUR_LOGPUSH_BUCKET_NAME"       # ← 替换
+
+# Logpush 写入 R2 的路径前缀（默认格式：logs/YYYYMMDD/文件名.log.gz）
+LOG_PREFIX = "logs/"
+
+# ── 时间控制 ──────────────────────────────────────────────────
+# 只处理此 UTC 时间点之后写入 R2 的文件
+# 用途：避免处理海量历史数据，从指定时间点开始出图
+# 格式：ISO 8601 UTC，例如 "2026-04-14T00:00:00Z"
+START_TIME = "2026-04-14T00:00:00Z"                # ← 按需修改
+
+# Safe Lag Window（分钟）
+# 只处理当前时间减去此值之前的文件，确保 Logpush 文件已全部落盘
+# 建议不低于 10 分钟
+LAG_MINUTES = "10"
+
+# ── 流控配置 ──────────────────────────────────────────────────
+# Cron 每次最多扫描并入队多少个文件（防瞬间大量文件涌入）
+SCAN_BATCH_SIZE = "20"
+
+# CF REST API 调用间隔（毫秒）
+# CF API Rate Limit：1200次/5分钟 = 4 req/s，300ms ≈ 3.3 req/s
+RATE_LIMIT_DELAY_MS = "300"
+
+# processing 状态超时阈值（分钟），超时则认为 Worker 已崩溃，允许重试
+MAX_PROCESSING_MIN = "15"
+
+# ── 数据生命周期 ───────────────────────────────────────────────
+# D1 数据最长保留天数，超期数据每日 UTC 02:00 自动清理
+DATA_RETENTION_DAYS = "7"
+
+# ── Dashboard 访问鉴权 ─────────────────────────────────────────
+# 留空 = 不鉴权（本地开发用）
+# 生产环境强烈建议用 secret 设置：wrangler secret put DASHBOARD_TOKEN
+DASHBOARD_TOKEN = ""
+
+# ── Secrets（敏感信息，不写在此文件，用命令行单独设置）───────────
+# 执行以下命令设置：
+#
+#   wrangler secret put CF_API_TOKEN
+#   （填写有权限读取目标 R2 Bucket 的 Cloudflare API Token）
+#
+# API Token 所需权限：
+#   - Account > R2 Storage > Read（读取 Logpush 日志文件）
+#   - 如果 R2 所在账号与部署 Worker 的账号不同，需要跨账号 Token
+#
+# 获取方式：CF Dashboard → My Profile → API Tokens → Create Token
