@@ -23,3 +23,16 @@ CREATE INDEX IF NOT EXISTS idx_bw_minute   ON bw_stats(minute_utc);
 CREATE INDEX IF NOT EXISTS idx_bw_zone     ON bw_stats(zone);
 CREATE INDEX IF NOT EXISTS idx_file_status ON processed_files(status);
 CREATE INDEX IF NOT EXISTS idx_file_time   ON processed_files(started_at);
+
+-- 告警历史表（防重复告警 + 告警记录）
+CREATE TABLE IF NOT EXISTS alert_history (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    alert_type  TEXT    NOT NULL,   -- 'threshold'（固定阈值）| 'spike'（突增）
+    zone        TEXT    NOT NULL,
+    minute_utc  TEXT    NOT NULL,   -- 触发告警的分钟
+    mbps        REAL    NOT NULL,   -- 触发时的带宽值
+    detail      TEXT,               -- 告警详情 JSON（如历史峰值、倍数等）
+    alerted_at  TEXT    NOT NULL    -- 告警发出的时间（ISO 8601）
+);
+
+CREATE INDEX IF NOT EXISTS idx_alert_zone_type ON alert_history(zone, alert_type, alerted_at);

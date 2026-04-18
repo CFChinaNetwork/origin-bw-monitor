@@ -47,6 +47,11 @@ function getConfig(env) {
     retentionDays:    parseInt(env.DATA_RETENTION_DAYS  || '7',  10),
     dashToken:        env.DASHBOARD_TOKEN || '',
     logLevel:         env.LOG_LEVEL       || 'info',
+    // 告警配置（留空 = 不启用）
+    alertThresholdMbps:   env.ALERT_THRESHOLD_MBPS   ? parseFloat(env.ALERT_THRESHOLD_MBPS)   : null,
+    alertSpikeMultiplier: env.ALERT_SPIKE_MULTIPLIER  ? parseFloat(env.ALERT_SPIKE_MULTIPLIER) : null,
+    alertCooldownMin:     parseInt(env.ALERT_COOLDOWN_MIN || '30', 10),
+    alertDashboardUrl:    env.ALERT_DASHBOARD_URL || '',
   };
 }
 
@@ -253,6 +258,13 @@ async function processFile(key, env) {
 
   // 写入 D1（累加 upsert，支持多文件写同一分钟）
   await flushToD1(minuteMap, env);
+
+  // 写入后立即检测告警（异步，不阻塞主流程）
+  if (c.alertThresholdMbps !== null || c.alertSpikeMultiplier !== null) {
+    checkAndAlert(minuteMap, env).catch(err =>
+      log(env, 'warn', `Alert check failed: ${err.message}`)
+    );
+  }
 
   // 标记为 done
   await env.DB.prepare(`
@@ -582,8 +594,11 @@ const HDRS  = TOKEN ? { Authorization: 'Bearer ' + TOKEN } : {};
 let chartBw = null;
 
 function toCST(minute_utc) {
-  const t = new Date(minute_utc + ':00Z');
-  return new Date(t.getTime() + 8 * 3600000).toISOString().slice(11, 16) + ' CST';
+  const t   = new Date(minute_utc + ':00Z');
+  const cst = new Date(t.getTime() + 8 * 3600000);
+  const iso = cst.toISOString();
+  // 格式：2026-04-18 10:38 GMT+8
+  return iso.slice(0, 10) + ' ' + iso.slice(11, 16) + ' GMT+8';
 }
 
 async function loadChart() {
@@ -626,7 +641,16 @@ async function loadChart() {
       responsive: true,
       interaction: { mode: 'index', intersect: false },
       scales: {
-        x: { ticks: { color: '#777', maxTicksLimit: 12, maxRotation: 0 }, grid: { color: '#1a1a1a' } },
+        x: { ticks: { color: '#777', maxTicksLimit: 12, maxRotation: 0,
+               callback: function(value, index, ticks) {
+                 const label = this.getLabelForValue(value);
+                 // 第一个和最后一个显示完整日期+时间，中间的只显示时间
+                 if (index === 0 || index === ticks.length - 1) return label;
+                 // 去掉日期部分，只保留 "HH:MM GMT+8"
+                 const parts = label.split(' ');
+                 return parts[1] + ' ' + parts[2]; // "HH:MM GMT+8"
+               }
+             }, grid: { color: '#1a1a1a' } },
         y: { ticks: { color: '#777', callback: v => v + ' Mbps' }, grid: { color: '#1a1a1a' }, beginAtZero: true }
       },
       plugins: {
@@ -673,8 +697,11 @@ async function cleanupOldData(env) {
     const r2 = await env.DB.prepare(
       `DELETE FROM processed_files WHERE finished_at IS NOT NULL AND finished_at < ?`
     ).bind(cutoffFull).run();
+    const r3 = await env.DB.prepare(
+      `DELETE FROM alert_history WHERE alerted_at < ?`
+    ).bind(cutoffFull).run();
     log(env, 'info',
-      `Cleanup done: bw_stats=${r1.meta?.changes??0} rows, processed_files=${r2.meta?.changes??0} rows`
+      `Cleanup done: bw_stats=${r1.meta?.changes??0} rows, processed_files=${r2.meta?.changes??0} rows, alert_history=${r3.meta?.changes??0} rows`
     );
   } catch (err) { log(env, 'error', `Cleanup failed: ${err.message}`); }
 }
@@ -708,4 +735,229 @@ function log(env, level, msg) {
     const fn = level === 'error' ? console.error : level === 'warn' ? console.warn : console.log;
     fn(`[${level.toUpperCase()}] ${new Date().toISOString()} ${msg}`);
   }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 告警模块：写入 D1 后立即检测，支持固定阈值 + 突增检测
+// 支持企业微信 / 钉钉 / 飞书 三平台卡片消息，任意组合
+// ═══════════════════════════════════════════════════════════════
+
+async function checkAndAlert(minuteMap, env) {
+  const c   = getConfig(env);
+  const now = new Date().toISOString();
+
+  // 24小时前（用于突增检测的历史窗口）
+  const since24h = new Date(Date.now() - 24 * 3600 * 1000).toISOString().slice(0, 16);
+
+  for (const [mapKey, v] of minuteMap.entries()) {
+    const idx    = mapKey.indexOf('\x00');
+    const minute = mapKey.slice(0, idx);
+    const zone   = mapKey.slice(idx + 1);
+    if (zone === 'unknown') continue;
+
+    const mbps = v.sum / 60 * 8 / 1048576;
+    if (mbps <= 0) continue;
+
+    // ── 告警1：固定阈值 ──────────────────────────────────────
+    if (c.alertThresholdMbps !== null && mbps >= c.alertThresholdMbps) {
+      const cooldownOk = await checkCooldown('threshold', zone, c.alertCooldownMin, env);
+      if (cooldownOk) {
+        const detail = { threshold: c.alertThresholdMbps, current: mbps };
+        await sendAlert({
+          type:    'threshold',
+          zone,
+          minute,
+          mbps,
+          detail,
+          title:   '🚨 CF 回源带宽超阈值告警',
+          summary: `当前带宽 **${mbps.toFixed(1)} Mbps** 超过设定阈值 **${c.alertThresholdMbps} Mbps**`,
+          dashUrl: c.alertDashboardUrl,
+        }, env);
+        await recordAlert('threshold', zone, minute, mbps, detail, env);
+        log(env, 'warn', `Alert [threshold] zone=${zone} mbps=${mbps.toFixed(1)} threshold=${c.alertThresholdMbps}`);
+      }
+    }
+
+    // ── 告警2：突增检测 ──────────────────────────────────────
+    if (c.alertSpikeMultiplier !== null) {
+      // 查过去24小时该 zone 的历史最高 mbps（排除当前分钟）
+      const row = await env.DB.prepare(`
+        SELECT MAX(ROUND(CAST(sum_bytes AS REAL) / 60.0 * 8.0 / 1048576.0, 2)) AS peak_mbps
+        FROM bw_stats
+        WHERE zone = ? AND minute_utc >= ? AND minute_utc < ?
+      `).bind(zone, since24h, minute).first();
+
+      const historicPeak = row?.peak_mbps || 0;
+      if (historicPeak > 0 && mbps >= historicPeak * c.alertSpikeMultiplier) {
+        const cooldownOk = await checkCooldown('spike', zone, c.alertCooldownMin, env);
+        if (cooldownOk) {
+          const ratio  = (mbps / historicPeak).toFixed(1);
+          const detail = { multiplier: c.alertSpikeMultiplier, current: mbps, historicPeak, ratio };
+          await sendAlert({
+            type:    'spike',
+            zone,
+            minute,
+            mbps,
+            detail,
+            title:   '⚡ CF 回源带宽突增告警',
+            summary: `当前带宽 **${mbps.toFixed(1)} Mbps**，是过去24小时最高值 **${historicPeak.toFixed(1)} Mbps** 的 **${ratio} 倍**（阈值：${c.alertSpikeMultiplier} 倍）`,
+            dashUrl: c.alertDashboardUrl,
+          }, env);
+          await recordAlert('spike', zone, minute, mbps, detail, env);
+          log(env, 'warn', `Alert [spike] zone=${zone} mbps=${mbps.toFixed(1)} peak=${historicPeak.toFixed(1)} ratio=${ratio}`);
+        }
+      }
+    }
+  }
+}
+
+// ── 冷却检查：同 zone 同类型告警是否已在冷却期内 ──────────────
+async function checkCooldown(alertType, zone, cooldownMin, env) {
+  const since = new Date(Date.now() - cooldownMin * 60 * 1000).toISOString();
+  const row = await env.DB.prepare(`
+    SELECT id FROM alert_history
+    WHERE alert_type = ? AND zone = ? AND alerted_at >= ?
+    LIMIT 1
+  `).bind(alertType, zone, since).first();
+  return !row;  // true = 不在冷却期，可以发告警
+}
+
+// ── 记录告警历史 ──────────────────────────────────────────────
+async function recordAlert(alertType, zone, minute, mbps, detail, env) {
+  await env.DB.prepare(`
+    INSERT INTO alert_history (alert_type, zone, minute_utc, mbps, detail, alerted_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).bind(alertType, zone, minute, mbps, JSON.stringify(detail), new Date().toISOString()).run();
+}
+
+// ── 发送告警到各平台 ─────────────────────────────────────────
+async function sendAlert({ type, zone, minute, mbps, detail, title, summary, dashUrl }, env) {
+  // 时间转 GMT+8 显示
+  const t   = new Date(minute + ':00Z');
+  const cst = new Date(t.getTime() + 8 * 3600000);
+  const timeStr = cst.toISOString().slice(0, 10) + ' ' + cst.toISOString().slice(11, 16) + ' GMT+8';
+
+  const tasks = [];
+
+  // 企业微信
+  if (env.ALERT_WEBHOOK_WECOM) {
+    tasks.push(sendWeCom(env.ALERT_WEBHOOK_WECOM, { title, summary, zone, timeStr, mbps, detail, dashUrl }));
+  }
+  // 钉钉
+  if (env.ALERT_WEBHOOK_DINGTALK) {
+    tasks.push(sendDingTalk(env.ALERT_WEBHOOK_DINGTALK, { title, summary, zone, timeStr, mbps, detail, dashUrl }));
+  }
+  // 飞书
+  if (env.ALERT_WEBHOOK_FEISHU) {
+    tasks.push(sendFeishu(env.ALERT_WEBHOOK_FEISHU, { title, summary, zone, timeStr, mbps, detail, dashUrl }));
+  }
+
+  if (tasks.length === 0) return;
+  const results = await Promise.allSettled(tasks);
+  results.forEach((r, i) => {
+    if (r.status === 'rejected') {
+      console.warn(`[WARN] Alert channel ${i} failed: ${r.reason?.message}`);
+    }
+  });
+}
+
+// ── 企业微信 Markdown 卡片 ────────────────────────────────────
+async function sendWeCom(webhookUrl, { title, summary, zone, timeStr, mbps, detail, dashUrl }) {
+  let content = `## ${title}\n\n`;
+  content += `> **域名：** ${zone}\n`;
+  content += `> **时间：** ${timeStr}\n`;
+  content += `> **当前带宽：** <font color="warning">${mbps.toFixed(1)} Mbps</font>\n`;
+  if (detail.threshold) {
+    content += `> **设定阈值：** ${detail.threshold} Mbps\n`;
+  }
+  if (detail.historicPeak) {
+    content += `> **24h历史峰值：** ${detail.historicPeak.toFixed(1)} Mbps\n`;
+    content += `> **当前倍数：** <font color="warning">${detail.ratio} 倍</font>\n`;
+  }
+  if (dashUrl) {
+    content += `\n[查看监控面板](${dashUrl}?zone=${encodeURIComponent(zone)}&hours=24)`;
+  }
+
+  await fetch(webhookUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ msgtype: 'markdown', markdown: { content } }),
+  });
+}
+
+// ── 钉钉 ActionCard ───────────────────────────────────────────
+async function sendDingTalk(webhookUrl, { title, summary, zone, timeStr, mbps, detail, dashUrl }) {
+  let text = `## ${title}\n\n`;
+  text += `**域名：** ${zone}  \n`;
+  text += `**时间：** ${timeStr}  \n`;
+  text += `**当前带宽：** ${mbps.toFixed(1)} Mbps  \n`;
+  if (detail.threshold) {
+    text += `**设定阈值：** ${detail.threshold} Mbps  \n`;
+  }
+  if (detail.historicPeak) {
+    text += `**24h历史峰值：** ${detail.historicPeak.toFixed(1)} Mbps  \n`;
+    text += `**当前倍数：** ${detail.ratio} 倍  \n`;
+  }
+
+  const body = {
+    msgtype: 'actionCard',
+    actionCard: {
+      title,
+      text,
+      btnOrientation: '0',
+      btns: dashUrl
+        ? [{ title: '查看监控面板', actionURL: dashUrl + '?zone=' + encodeURIComponent(zone) + '&hours=24' }]
+        : [],
+    },
+  };
+
+  await fetch(webhookUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+}
+
+// ── 飞书 Interactive Card ─────────────────────────────────────
+async function sendFeishu(webhookUrl, { title, summary, zone, timeStr, mbps, detail, dashUrl }) {
+  const fields = [
+    { is_short: true, text: { tag: 'lark_md', content: `**域名**\n${zone}` } },
+    { is_short: true, text: { tag: 'lark_md', content: `**时间**\n${timeStr}` } },
+    { is_short: true, text: { tag: 'lark_md', content: `**当前带宽**\n${mbps.toFixed(1)} Mbps` } },
+  ];
+
+  if (detail.threshold) {
+    fields.push({ is_short: true, text: { tag: 'lark_md', content: `**设定阈值**\n${detail.threshold} Mbps` } });
+  }
+  if (detail.historicPeak) {
+    fields.push({ is_short: true, text: { tag: 'lark_md', content: `**24h历史峰值**\n${detail.historicPeak.toFixed(1)} Mbps` } });
+    fields.push({ is_short: true, text: { tag: 'lark_md', content: `**当前倍数**\n${detail.ratio} 倍` } });
+  }
+
+  const elements = [{ tag: 'div', fields }];
+  if (dashUrl) {
+    elements.push({
+      tag: 'action',
+      actions: [{
+        tag: 'button',
+        text: { tag: 'plain_text', content: '查看监控面板' },
+        url: dashUrl + '?zone=' + encodeURIComponent(zone) + '&hours=24',
+        type: 'default',
+      }],
+    });
+  }
+
+  const body = {
+    msg_type: 'interactive',
+    card: {
+      header: { title: { tag: 'plain_text', content: title }, template: 'red' },
+      elements,
+    },
+  };
+
+  await fetch(webhookUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
 }
