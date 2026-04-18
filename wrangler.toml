@@ -3,129 +3,78 @@ main = "src/index.js"
 compatibility_date = "2026-04-01"
 compatibility_flags = ["nodejs_compat"]
 
-# account_id 不写在这里，由 CLOUDFLARE_API_TOKEN 环境变量或 wrangler login 决定
-
 # ── Observability ─────────────────────────────────────────────
 [observability]
 [observability.logs]
 enabled         = true
 invocation_logs = true
 
-# ── Cron 调度 ─────────────────────────────────────────────────
-# cron 1：每10分钟扫描 R2 新文件并入队处理
-# cron 2：每天 UTC 02:00 执行 D1 数据生命周期清理
+# ── Cron：每天 UTC 02:00 清理 D1 过期数据 ────────────────────
 [triggers]
-crons = ["*/10 * * * *", "0 2 * * *"]
+crons = ["0 2 * * *"]
 
-# ── R2 存储桶（Logpush 写入的同一个桶，直接 binding）─────────
-# binding = "LOGPUSH_BUCKET" 不要修改，index.js 通过此名称访问
-# bucket_name 改为你的 Logpush R2 桶名
+# ── R2 存储桶（Logpush 同一个桶，R2 Binding 只读）─────────────
+# binding 不要改；bucket_name 改为你的 Logpush R2 桶名
 [[r2_buckets]]
 binding     = "LOGPUSH_BUCKET"
-bucket_name = "cdn-logs-raw"   # ← 替换为实际 R2 桶名
+bucket_name = "cdn-logs-raw"
 
 # ── D1 数据库 ─────────────────────────────────────────────────
-# 先执行 `wrangler d1 create bw-stats` 获取 database_id，填入下方
 [[d1_databases]]
 binding       = "DB"
 database_name = "bw-stats"
 database_id   = "a0546e2b-0487-4124-b4ac-6dad1aa079eb"
 
-# ── Queue 生产者 ──────────────────────────────────────────────
+# ── Queue（由 R2 Event Notification 触发，Worker 消费）────────
 [[queues.producers]]
 binding = "INGEST_QUEUE"
 queue   = "bw-ingest-queue"
 
-# ── Queue 消费者（保守串行配置）──────────────────────────────
 [[queues.consumers]]
 queue             = "bw-ingest-queue"
-max_batch_size    = 3       # 每批最多3个文件，控制内存压力
+max_batch_size    = 3
 max_batch_timeout = 30
 max_retries       = 3
 dead_letter_queue = "bw-ingest-dlq"
 
-# ── Worker 资源限制 ───────────────────────────────────────────
 [limits]
-cpu_ms = 300000   # Queue Consumer 最大 CPU 时间：5分钟
+cpu_ms = 300000
 
-# ── 业务配置变量 ───────────────────────────────────────────────
-# 所有变量集中在此，index.js 永远不需要修改
-
+# ── 配置变量（全部在此，index.js 永不需要修改）────────────────
 [vars]
-
-# 日志级别：debug / info / warn / error
 LOG_LEVEL = "info"
 
-# ── Logpush 日志路径前缀 ───────────────────────────────────────
-# 默认 Logpush 写入格式：logs/YYYYMMDD/文件名.log.gz
+# Logpush 写入 R2 的路径前缀
 LOG_PREFIX = "logs/"
 
-# ── 时间控制 ──────────────────────────────────────────────────
-# 只处理此 UTC 时间点之后写入 R2 的文件
-# 用途：避免处理海量历史数据，从指定时间点开始出图
-# 格式：ISO 8601 UTC，例如 "2026-04-14T00:00:00Z"
-START_TIME = "2026-04-11T00:00:00Z"   # ← 按需修改为你的起始分析日期
-
-# Safe Lag Window（分钟）
-# 只处理当前时间减去此值之前的文件，确保 Logpush 文件已全部落盘
+# Safe Lag Window（分钟）：等待该分钟内所有 Logpush 文件全部落盘
 # 建议不低于 10 分钟
 LAG_MINUTES = "10"
 
-# ── 流控配置 ──────────────────────────────────────────────────
-# Cron 每次最多扫描并入队多少个文件（防瞬间大量文件涌入）
-SCAN_BATCH_SIZE = "20"
-
-# processing 状态超时阈值（分钟），超时则认为 Worker 已崩溃，允许重试
+# processing 状态超时（分钟），超时则认为 Worker 崩溃，允许重试
 MAX_PROCESSING_MIN = "15"
 
-# ── 数据生命周期 ───────────────────────────────────────────────
-# D1 数据最长保留天数，超期数据每日 UTC 02:00 自动清理
+# D1 数据保留天数，每日 UTC 02:00 自动清理
 DATA_RETENTION_DAYS = "7"
 
-# ── Dashboard 访问鉴权 ─────────────────────────────────────────
-# 留空 = 不鉴权（本地开发用）
-# 生产环境强烈建议用 secret 设置：wrangler secret put DASHBOARD_TOKEN
+# Dashboard 访问鉴权（留空 = 不鉴权）
+# 生产环境建议：wrangler secret put DASHBOARD_TOKEN
 DASHBOARD_TOKEN = ""
 
-# ── 告警配置 ──────────────────────────────────────────────────
+# ── 告警配置（留空 = 不启用该告警机制）──────────────────────
+# 固定阈值告警（Mbps），超过即告警，例如 "500"
+ALERT_THRESHOLD_MBPS = "0.1"
 
-# 固定阈值告警（Mbps）：当前分钟带宽超过此值触发告警
-# 留空 = 不启用此告警机制
-# 示例：ALERT_THRESHOLD_MBPS = "500"
-ALERT_THRESHOLD_MBPS = ""
+# 突增倍数告警（与过去24小时最高值对比），例如 "5"
+ALERT_SPIKE_MULTIPLIER = "2"
 
-# 突增倍数告警：当前带宽超过过去24小时历史最高值的N倍时触发
-# 留空 = 不启用此告警机制
-# 示例：ALERT_SPIKE_MULTIPLIER = "5"
-ALERT_SPIKE_MULTIPLIER = ""
-
-# 告警冷却时间（分钟）：同一 zone 同类告警在冷却期内只发一次，防止告警风暴
-# 默认 30 分钟
+# 同 zone 同类告警的冷却时间（分钟），防止告警风暴
 ALERT_COOLDOWN_MIN = "30"
 
-# Dashboard 公开 URL（用于告警消息中的跳转链接，留空则不显示）
-# 示例：ALERT_DASHBOARD_URL = "https://origin-bw-monitor.xxx.workers.dev"
-ALERT_DASHBOARD_URL = ""
+# 告警消息里的面板跳转链接（留空则不显示）
+ALERT_DASHBOARD_URL = "https://origin-bw-monitor.steve-account-test.workers.dev"
 
-# ── 告警渠道（Webhook URL 通过 wrangler secret put 设置，不写在此文件）──
-#
-# 企业微信机器人 Webhook：
-#   wrangler secret put ALERT_WEBHOOK_WECOM
-#   URL 格式：https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=YOUR_KEY
-#
-# 钉钉机器人 Webhook：
-#   wrangler secret put ALERT_WEBHOOK_DINGTALK
-#   URL 格式：https://oapi.dingtalk.com/robot/send?access_token=YOUR_TOKEN
-#
-# 飞书机器人 Webhook：
-#   wrangler secret put ALERT_WEBHOOK_FEISHU
-#   URL 格式：https://open.feishu.cn/open-apis/bot/v2/hook/YOUR_KEY
-#
-# 三个渠道可任意组合，留空（不设置 secret）= 不启用该渠道
-
-# ── Secrets（敏感信息，不写在此文件，用命令行单独设置）───────────
-# Dashboard 访问鉴权（可选）：
-#   wrangler secret put DASHBOARD_TOKEN
-#
-# 注意：使用 R2 Binding 方式，不需要任何 API Key 或 Token 来访问 R2。
-# R2 访问权限由 [[r2_buckets]] binding 自动授权，无需额外密钥。
+# ── 告警渠道（通过 wrangler secret put 设置，不写在此文件）────
+# 企业微信：wrangler secret put ALERT_WEBHOOK_WECOM
+# 钉钉：    wrangler secret put ALERT_WEBHOOK_DINGTALK
+# 飞书：    wrangler secret put ALERT_WEBHOOK_FEISHU
