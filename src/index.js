@@ -628,6 +628,7 @@ input{width:320px}
     Source: Logpush → R2 → Workers → D1 → Chart.js
     &nbsp;|&nbsp;Data lag: ~10 min
     &nbsp;|&nbsp;Retention: 7 days
+    &nbsp;|&nbsp;Auto-refresh: every 60s
     &nbsp;|&nbsp;Last updated: <span id="lu">—</span>
   </p>
 </div>
@@ -706,7 +707,17 @@ async function loadStatus(){
       ' | data: '+cst(j.data_range?.min_t)+' ~ '+cst(j.data_range?.max_t);
   }catch(e){document.getElementById('st').textContent='❌ '+e.message;}
 }
-if('${zone}')loadChart();
+// 自动刷新：每60秒重新加载图表数据
+let autoRefreshTimer = null;
+function startAutoRefresh() {
+  if (autoRefreshTimer) clearInterval(autoRefreshTimer);
+  autoRefreshTimer = setInterval(() => {
+    loadChart();
+  }, 60000);
+}
+
+// 页面加载时自动加载图表并启动自动刷新
+loadChart().then(() => startAutoRefresh());
 </script>
 </body></html>`;
 
