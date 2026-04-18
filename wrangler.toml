@@ -28,10 +28,8 @@ database_name = "bw-stats"
 database_id   = "a0546e2b-0487-4124-b4ac-6dad1aa079eb"
 
 # ── Queue（由 R2 Event Notification 触发，Worker 消费）────────
-[[queues.producers]]
-binding = "INGEST_QUEUE"
-queue   = "bw-ingest-queue"
-
+# 注：只需 Consumer，不需要 Producer binding
+# R2 Event Notification 直接向 Queue 发消息，Worker 只消费
 [[queues.consumers]]
 queue             = "bw-ingest-queue"
 max_batch_size    = 3
@@ -50,7 +48,7 @@ LOG_LEVEL = "info"
 LOG_PREFIX = "logs/"
 
 # Safe Lag Window（分钟）：等待该分钟内所有 Logpush 文件全部落盘
-# 建议不低于 10 分钟
+# 建议不低于 5 分钟，默认 7 分钟（总延迟约 10 分钟）
 LAG_MINUTES = "7"
 
 # processing 状态超时（分钟），超时则认为 Worker 崩溃，允许重试

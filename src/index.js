@@ -281,48 +281,51 @@ async function checkAndAlertFromD1(env) {
     ORDER BY mbps DESC
   `).bind(prevMinute).all()).results;
 
-  for (const { zone, mbps } of rows) {
-    if (zone === 'unknown' || mbps <= 0) continue;
+  // 并发处理每个 zone 的告警检测，避免大流量多 zone 时串行等待
+  await Promise.allSettled(rows
+    .filter(({ zone, mbps }) => zone !== 'unknown' && mbps > 0)
+    .map(({ zone, mbps }) => checkZoneAlert(zone, mbps, prevMinute, since24h, c, env))
+  );
+}
 
-    // ── 告警1：固定阈值 ─────────────────────────────────────
-    if (c.alertThresholdMbps !== null && mbps >= c.alertThresholdMbps) {
-      const cooldownOk = await checkCooldown('threshold', zone, c.alertCooldownMin, env);
+// ── 单个 zone 的告警检测（并发安全）────────────────────────────
+async function checkZoneAlert(zone, mbps, prevMinute, since24h, c, env) {
+  // 告警1：固定阈值
+  if (c.alertThresholdMbps !== null && mbps >= c.alertThresholdMbps) {
+    const cooldownOk = await checkCooldown('threshold', zone, c.alertCooldownMin, env);
+    if (cooldownOk) {
+      const detail = { threshold: c.alertThresholdMbps, current: mbps };
+      await sendAlert({
+        type: 'threshold', zone, minute: prevMinute, mbps, detail,
+        title:   '🚨 CF 回源带宽超阈值告警',
+        summary: `当前带宽 **${mbps.toFixed(3)} Mbps** 超过设定阈值 **${c.alertThresholdMbps} Mbps**`,
+        dashUrl: c.alertDashboardUrl,
+      }, env);
+      await recordAlert('threshold', zone, prevMinute, mbps, detail, env);
+    }
+  }
+
+  // 告警2：突增检测
+  if (c.alertSpikeMultiplier !== null) {
+    const row = await env.DB.prepare(`
+      SELECT MAX(ROUND(CAST(sum_bytes AS REAL)/60.0*8.0/1048576.0,4)) AS peak
+      FROM bw_stats
+      WHERE zone = ? AND minute_utc >= ? AND minute_utc < ?
+    `).bind(zone, since24h, prevMinute).first();
+
+    const peak = row?.peak || 0;
+    if (peak > 0 && mbps >= peak * c.alertSpikeMultiplier) {
+      const cooldownOk = await checkCooldown('spike', zone, c.alertCooldownMin, env);
       if (cooldownOk) {
-        const detail = { threshold: c.alertThresholdMbps, current: mbps };
+        const ratio  = (mbps / peak).toFixed(1);
+        const detail = { multiplier: c.alertSpikeMultiplier, current: mbps, historicPeak: peak, ratio };
         await sendAlert({
-          type: 'threshold', zone, minute: prevMinute, mbps, detail,
-          title:   '🚨 CF 回源带宽超阈值告警',
-          summary: `当前带宽 **${mbps.toFixed(3)} Mbps** 超过设定阈值 **${c.alertThresholdMbps} Mbps**`,
+          type: 'spike', zone, minute: prevMinute, mbps, detail,
+          title:   '⚡ CF 回源带宽突增告警',
+          summary: `当前带宽 **${mbps.toFixed(3)} Mbps**，是过去24小时最高值 **${peak.toFixed(3)} Mbps** 的 **${ratio} 倍**`,
           dashUrl: c.alertDashboardUrl,
         }, env);
-        await recordAlert('threshold', zone, prevMinute, mbps, detail, env);
-        log(env, 'warn', `Alert [threshold] zone=${zone} mbps=${mbps} threshold=${c.alertThresholdMbps}`);
-      }
-    }
-
-    // ── 告警2：突增检测 ─────────────────────────────────────
-    if (c.alertSpikeMultiplier !== null) {
-      const row = await env.DB.prepare(`
-        SELECT MAX(ROUND(CAST(sum_bytes AS REAL)/60.0*8.0/1048576.0,4)) AS peak
-        FROM bw_stats
-        WHERE zone = ? AND minute_utc >= ? AND minute_utc < ?
-      `).bind(zone, since24h, prevMinute).first();
-
-      const peak = row?.peak || 0;
-      if (peak > 0 && mbps >= peak * c.alertSpikeMultiplier) {
-        const cooldownOk = await checkCooldown('spike', zone, c.alertCooldownMin, env);
-        if (cooldownOk) {
-          const ratio  = (mbps / peak).toFixed(1);
-          const detail = { multiplier: c.alertSpikeMultiplier, current: mbps, historicPeak: peak, ratio };
-          await sendAlert({
-            type: 'spike', zone, minute: prevMinute, mbps, detail,
-            title:   '⚡ CF 回源带宽突增告警',
-            summary: `当前带宽 **${mbps.toFixed(3)} Mbps**，是过去24小时最高值 **${peak.toFixed(3)} Mbps** 的 **${ratio} 倍**`,
-            dashUrl: c.alertDashboardUrl,
-          }, env);
-          await recordAlert('spike', zone, prevMinute, mbps, detail, env);
-          log(env, 'warn', `Alert [spike] zone=${zone} mbps=${mbps} peak=${peak} ratio=${ratio}`);
-        }
+        await recordAlert('spike', zone, prevMinute, mbps, detail, env);
       }
     }
   }
@@ -432,20 +435,24 @@ async function sendFeishu(url, { title, zone, timeStr, mbps, detail, dashUrl }) 
 // ═══════════════════════════════════════════════════════════════
 // Cron 每20分钟：重试 pending 状态文件
 // pending = 之前因 lag 窗口被推迟，现在 lag 窗口已过，可以重新处理
+// 只重试 started_at 超过 lag 窗口的文件，避免重试刚被设为 pending 的文件
 // ═══════════════════════════════════════════════════════════════
 async function retryPendingFiles(env) {
   const c = getConfig(env);
 
-  // 只重试 lag 窗口已过的 pending 文件
-  // 通过文件名里的时间戳判断：文件名格式 logs/YYYYMMDD/YYYYMMDDTHHmmssZ_...
-  // 简单起见：查所有 pending 文件，让 processFile 自己判断是否还在 lag 内
+  // 只重试 started_at 早于 lagMinutes 前的 pending 文件
+  // 即：文件被设为 pending 的时间已经超过 lag 窗口，说明现在可以重新处理了
+  const lagCutoff = new Date(Date.now() - c.lagMinutes * 60 * 1000).toISOString();
+
   const rows = (await env.DB.prepare(
-    `SELECT r2_key FROM processed_files WHERE status = 'pending' LIMIT 20`
-  ).all()).results;
+    `SELECT r2_key FROM processed_files
+     WHERE status = 'pending' AND started_at < ?
+     ORDER BY started_at ASC LIMIT 20`
+  ).bind(lagCutoff).all()).results;
 
   if (rows.length === 0) return;
 
-  log(env, 'info', `Cron retry: found ${rows.length} pending files`);
+  log(env, 'info', `Cron retry: found ${rows.length} pending files ready for retry`);
   for (const { r2_key } of rows) {
     try {
       await processFile(r2_key, env);
