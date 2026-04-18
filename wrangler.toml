@@ -87,9 +87,6 @@ DATA_RETENTION_DAYS = "7"
 # 生产环境强烈建议用 secret 设置：wrangler secret put DASHBOARD_TOKEN
 DASHBOARD_TOKEN = ""
 
-workers_dev  = false
-preview_urls = false
-
 # ── Secrets（敏感信息，不写在此文件，用命令行单独设置）───────────
 # 仅需设置 Dashboard 访问鉴权（可选）：
 #

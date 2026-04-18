@@ -53,4 +53,4 @@ wrangler deploy
 
 ## License
 
-[MIT](https://opensource.org/licenses/MIT) — Free to use, modify and distribute with attribution.
+Proprietary - Internal Use Only
