@@ -478,20 +478,46 @@ async function handleApiStats(request, env) {
   const url   = new URL(request.url);
   const zone  = url.searchParams.get('zone')  || '%';
   const hours = parseInt(url.searchParams.get('hours') || '24', 10);
-  const since = new Date(Date.now() - hours * 3600 * 1000).toISOString().slice(0, 16);
+
+  // 时间范围：从 hours 小时前 到 现在-lag（已处理的最新分钟）
+  const c       = getConfig(env);
+  const nowMs   = Date.now();
+  const endMs   = nowMs - c.lagMinutes * 60 * 1000;  // 最新可显示时间点
+  const startMs = nowMs - hours * 3600 * 1000;        // 选定时间范围起点
+
+  const since  = new Date(startMs).toISOString().slice(0, 16);
+  const endMin = new Date(endMs - 60 * 1000).toISOString().slice(0, 16); // 含最新完整分钟
 
   const rows = await env.DB.prepare(`
     SELECT minute_utc, zone, sum_bytes,
            ROUND(CAST(sum_bytes AS REAL)/60.0*8.0/1048576.0, 4) AS mbps
     FROM bw_stats
-    WHERE minute_utc >= ? AND zone LIKE ?
+    WHERE minute_utc >= ? AND minute_utc <= ? AND zone LIKE ?
     ORDER BY minute_utc ASC
-  `).bind(since, zone).all();
+  `).bind(since, endMin, zone).all();
+
+  // 补全首尾空数据点，确保横轴覆盖完整时间范围
+  // 规则：
+  //   - 首点：强制为 since（如 D1 最早数据晚于 since，前面补 0）
+  //   - 尾点：强制为 endMin（如 D1 最新数据早于 endMin，后面补 0）
+  const dataMap = new Map(rows.results.map(r => [r.minute_utc, r]));
+
+  // 只补首尾两个端点（不填充中间空洞，避免图表数据量过大）
+  const finalData = [...rows.results];
+
+  if (!dataMap.has(since)) {
+    finalData.unshift({ minute_utc: since, zone: zone === '%' ? 'all' : zone, sum_bytes: 0, mbps: 0 });
+  }
+  if (!dataMap.has(endMin) && endMin > since) {
+    finalData.push({ minute_utc: endMin, zone: zone === '%' ? 'all' : zone, sum_bytes: 0, mbps: 0 });
+  }
 
   return jsonResponse({
     formula: 'SUM(CacheResponseBytes) WHERE OriginStatus NOT IN (0,304) / 60s * 8bits / 1024^2 = Mbps',
     ref:     'https://developers.cloudflare.com/logs/faq/common-calculations/',
-    since, zone, count: rows.results.length, data: rows.results,
+    since, end: endMin, zone,
+    count: rows.results.length,
+    data:  finalData,
   });
 }
 
@@ -625,11 +651,11 @@ async function loadChart(){
     j=await r.json();
   }catch(e){document.getElementById('st').textContent='❌ '+e.message;return;}
   const d=j.data||[];
-  const labels=d.map(x=>{
+  const labels=d.map((x,index)=>{
     const t=new Date(x.minute_utc+':00Z'),c=new Date(t.getTime()+8*3600000),i=c.toISOString();
     const date=i.slice(0,10),time=i.slice(11,16);
-    const idx=d.indexOf(x);
-    return(idx===0||idx===d.length-1)?date+' '+time+' UTC+8':time+' UTC+8';
+    // 首尾显示完整日期+时间，中间只显示时间
+    return(index===0||index===d.length-1)?date+' '+time+' UTC+8':time+' UTC+8';
   });
   const vals=d.map(x=>x.mbps);
   const nz=vals.filter(v=>v>0);
