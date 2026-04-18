@@ -496,28 +496,27 @@ async function handleApiStats(request, env) {
   const since  = new Date(startMs).toISOString().slice(0, 16);
   const endMin = new Date(endMs - 60 * 1000).toISOString().slice(0, 16); // 含最新完整分钟
 
+  // 按分钟聚合所有 zone（跨 zone 求和），确保每个时间点只有一条数据
+  // 这样无论查单个 zone 还是全部 zone，图表始终只有一条线，标签清晰
   const rows = await env.DB.prepare(`
-    SELECT minute_utc, zone, sum_bytes,
-           ROUND(CAST(sum_bytes AS REAL)/60.0*8.0/1048576.0, 4) AS mbps
+    SELECT minute_utc,
+           SUM(sum_bytes) AS sum_bytes,
+           ROUND(CAST(SUM(sum_bytes) AS REAL)/60.0*8.0/1048576.0, 4) AS mbps
     FROM bw_stats
     WHERE minute_utc >= ? AND minute_utc <= ? AND zone LIKE ?
+    GROUP BY minute_utc
     ORDER BY minute_utc ASC
   `).bind(since, endMin, zone).all();
 
-  // 补全首尾空数据点，确保横轴覆盖完整时间范围
-  // 规则：
-  //   - 首点：强制为 since（如 D1 最早数据晚于 since，前面补 0）
-  //   - 尾点：强制为 endMin（如 D1 最新数据早于 endMin，后面补 0）
+  // 补首尾端点，确保横轴覆盖完整所选时间范围
   const dataMap = new Map(rows.results.map(r => [r.minute_utc, r]));
-
-  // 只补首尾两个端点（不填充中间空洞，避免图表数据量过大）
   const finalData = [...rows.results];
 
   if (!dataMap.has(since)) {
-    finalData.unshift({ minute_utc: since, zone: zone === '%' ? 'all' : zone, sum_bytes: 0, mbps: 0 });
+    finalData.unshift({ minute_utc: since, sum_bytes: 0, mbps: 0 });
   }
   if (!dataMap.has(endMin) && endMin > since) {
-    finalData.push({ minute_utc: endMin, zone: zone === '%' ? 'all' : zone, sum_bytes: 0, mbps: 0 });
+    finalData.push({ minute_utc: endMin, sum_bytes: 0, mbps: 0 });
   }
 
   return jsonResponse({
