@@ -100,55 +100,75 @@ export default {
 // ═══════════════════════════════════════════════════════════════
 // Cron 兜底扫描：列出新文件并入队
 // 正常流程由 R2 Event Notification 触发，此 Cron 仅作兜底保障
+// 支持分页，确保不遗漏文件
 // ═══════════════════════════════════════════════════════════════
 async function scanAndEnqueue(env) {
   const c = getConfig(env);
-  const safeCutoff = new Date(Date.now() - c.lagMinutes * 60 * 1000).toISOString();
+  const safeCutoff     = new Date(Date.now() - c.lagMinutes * 60 * 1000).toISOString();
+  const stuckThreshold = new Date(Date.now() - c.maxProcessingMin * 60 * 1000).toISOString();
 
   log(env, 'info', `Cron scan: prefix=${c.prefix} startTime=${c.startTime} safeCutoff=${safeCutoff}`);
 
-  // 列出 R2 文件（通过 R2 Binding，只读）
-  let listed;
-  try {
-    listed = await env.LOGPUSH_BUCKET.list({
-      prefix: c.prefix,
-      limit:  c.scanBatchSize,
-    });
-  } catch (err) {
-    log(env, 'error', `R2 list failed: ${err.message}`);
-    return;
-  }
-
   const toEnqueue = [];
-  const stuckThreshold = new Date(Date.now() - c.maxProcessingMin * 60 * 1000).toISOString();
+  let cursor = undefined;
+  let pageCount = 0;
 
-  for (const obj of listed.objects) {
-    const lm = obj.uploaded?.toISOString() || '';
-    if (lm < c.startTime)  continue;
-    if (lm > safeCutoff) { log(env, 'debug', `Skip (too recent): ${obj.key}`); continue; }
-
-    const existing = await env.DB.prepare(
-      `SELECT status, started_at FROM processed_files WHERE r2_key = ?`
-    ).bind(obj.key).first();
-
-    if (existing?.status === 'done') continue;
-
-    if (existing?.status === 'processing') {
-      if ((existing.started_at || '') > stuckThreshold) {
-        log(env, 'debug', `Skip (still processing): ${obj.key}`); continue;
-      }
-      log(env, 'warn', `Resetting stuck file: ${obj.key}`);
-      await env.DB.prepare(
-        `UPDATE processed_files SET status='pending', error_msg='reset_stuck' WHERE r2_key=?`
-      ).bind(obj.key).run();
+  // 分页扫描，直到没有更多文件或达到批次上限
+  while (true) {
+    let listed;
+    try {
+      listed = await env.LOGPUSH_BUCKET.list({
+        prefix: c.prefix,
+        limit:  1000,             // R2 list 单页上限
+        cursor,
+      });
+    } catch (err) {
+      log(env, 'error', `R2 list failed: ${err.message}`);
+      break;
     }
-    toEnqueue.push(obj.key);
+    pageCount++;
+
+    // 批量查询 D1（减少串行 SELECT，一次查完这一页所有 key 的状态）
+    const keys = listed.objects.map(o => o.key);
+    const placeholders = keys.map(() => '?').join(',');
+    const existingRows = keys.length > 0
+      ? (await env.DB.prepare(
+          `SELECT r2_key, status, started_at FROM processed_files WHERE r2_key IN (${placeholders})`
+        ).bind(...keys).all()).results
+      : [];
+    const existingMap = new Map(existingRows.map(r => [r.r2_key, r]));
+
+    for (const obj of listed.objects) {
+      const lm = obj.uploaded?.toISOString() || '';
+      if (lm < c.startTime)  continue;
+      if (lm > safeCutoff) { log(env, 'debug', `Skip (too recent): ${obj.key}`); continue; }
+
+      const existing = existingMap.get(obj.key);
+      if (existing?.status === 'done') continue;
+
+      if (existing?.status === 'processing') {
+        if ((existing.started_at || '') > stuckThreshold) {
+          log(env, 'debug', `Skip (still processing): ${obj.key}`); continue;
+        }
+        log(env, 'warn', `Resetting stuck file: ${obj.key}`);
+        await env.DB.prepare(
+          `UPDATE processed_files SET status='pending', error_msg='reset_stuck' WHERE r2_key=?`
+        ).bind(obj.key).run();
+      }
+      toEnqueue.push(obj.key);
+
+      // 达到批次上限就先入队，避免 Cron CPU 超时
+      if (toEnqueue.length >= c.scanBatchSize) break;
+    }
+
+    if (toEnqueue.length >= c.scanBatchSize || !listed.truncated) break;
+    cursor = listed.cursor;
   }
 
-  if (toEnqueue.length === 0) { log(env, 'info', 'Cron: no new files'); return; }
+  if (toEnqueue.length === 0) { log(env, 'info', `Cron: no new files (scanned ${pageCount} pages)`); return; }
 
   await env.INGEST_QUEUE.sendBatch(toEnqueue.map(key => ({ body: { key } })));
-  log(env, 'info', `Cron: enqueued ${toEnqueue.length} files`);
+  log(env, 'info', `Cron: enqueued ${toEnqueue.length} files (scanned ${pageCount} pages)`);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -277,8 +297,9 @@ function applyFormula(line, minuteMap, safeCutoffMs) {
   const d = new Date(te * 1000);
   d.setSeconds(0, 0);
   const minute = d.toISOString().slice(0, 16);       // "2026-04-14T03:01"
-  const zone   = r.ClientRequestHost || 'unknown';
-  const mapKey = `${minute}|${zone}`;
+  // 用 \x00 作为分隔符（域名不含此字符，防止含特殊字符的域名导致 split 错误）
+  const zone   = (r.ClientRequestHost || 'unknown').replace(/\x00/g, '');
+  const mapKey = `${minute}\x00${zone}`;
   const entry  = minuteMap.get(mapKey) || { sum: 0 };
   entry.sum   += cb;
   minuteMap.set(mapKey, entry);
@@ -294,7 +315,9 @@ async function flushToD1(minuteMap, env) {
   const CHUNK   = 80;
   for (let i = 0; i < entries.length; i += CHUNK) {
     const stmts = entries.slice(i, i + CHUNK).map(([mapKey, v]) => {
-      const [minute, zone] = mapKey.split('|');
+      const idx    = mapKey.indexOf('\x00');
+      const minute = mapKey.slice(0, idx);
+      const zone   = mapKey.slice(idx + 1);
       return env.DB.prepare(`
         INSERT INTO bw_stats (minute_utc, zone, sum_bytes)
         VALUES (?, ?, ?)
@@ -335,15 +358,28 @@ async function handleApiImport(request, env) {
   const toEnqueue = [];
   let filteredByTime = 0, filteredByLag = 0, filteredDone = 0;
 
-  for (const obj of listed.objects) {
-    const lm = obj.uploaded?.toISOString() || '';
-    if (lm < fromTime)   { filteredByTime++; continue; }
-    if (lm > safeCutoff) { filteredByLag++;  continue; }
-    const ex = await env.DB.prepare(
-      `SELECT status FROM processed_files WHERE r2_key=?`
-    ).bind(obj.key).first();
-    if (ex?.status === 'done') { filteredDone++; continue; }
-    toEnqueue.push(obj.key);
+  // 批量查询 D1，避免串行 N 次 SELECT
+  const candidateKeys = listed.objects
+    .filter(o => {
+      const lm = o.uploaded?.toISOString() || '';
+      if (lm < fromTime)   { filteredByTime++; return false; }
+      if (lm > safeCutoff) { filteredByLag++;  return false; }
+      return true;
+    })
+    .map(o => o.key);
+
+  const existingMap = new Map();
+  if (candidateKeys.length > 0) {
+    const ph   = candidateKeys.map(() => '?').join(',');
+    const rows = (await env.DB.prepare(
+      `SELECT r2_key, status FROM processed_files WHERE r2_key IN (${ph})`
+    ).bind(...candidateKeys).all()).results;
+    rows.forEach(r => existingMap.set(r.r2_key, r.status));
+  }
+
+  for (const key of candidateKeys) {
+    if (existingMap.get(key) === 'done') { filteredDone++; continue; }
+    toEnqueue.push(key);
   }
 
   let queued = 0;

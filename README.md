@@ -48,9 +48,9 @@ wrangler deploy
 
 | Language | File |
 |---|---|
-| English | [CF Origin Pull Bandwidth Monitor — Deployment Guide](docs/Origin-Pull-Bandwidth-Monitor-Guide.html) |
-| 中文 | [CF 回源带宽监控工具——部署与使用指南](docs/回源带宽监控工具部署指南.html) |
+| English | [CF Origin Pull Bandwidth Monitor — Deployment Guide](https://cfchinanetwork.github.io/origin-bw-monitor/Origin-Pull-Bandwidth-Monitor-Guide.html) |
+| 中文 | [CF 回源带宽监控工具——部署与使用指南](https://cfchinanetwork.github.io/origin-bw-monitor/%E5%9B%9E%E6%BA%90%E5%B8%A6%E5%AE%BD%E7%9B%91%E6%8E%A7%E5%B7%A5%E5%85%B7%E9%83%A8%E7%BD%B2%E6%8C%87%E5%8D%97.html) |
 
 ## License
 
-MIT
+[MIT](https://opensource.org/licenses/MIT) — Free to use, modify and distribute with attribution.
