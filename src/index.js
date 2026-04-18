@@ -79,8 +79,9 @@ export default {
       return new Response('Unauthorized', { status: 401 });
     }
     const path = new URL(request.url).pathname;
-    if (path === '/api/stats')  return handleApiStats(request, env);
-    if (path === '/api/status') return handleApiStatus(request, env);
+    if (path === '/api/stats')       return handleApiStats(request, env);
+    if (path === '/api/status')      return handleApiStatus(request, env);
+    if (path === '/api/test-alert')  return handleTestAlert(request, env);
     return handleDashboard(request, env);
   },
 };
@@ -177,9 +178,13 @@ async function processFile(key, env) {
 
   await flushToD1(minuteMap, env);
 
-  // 写入后：查 D1 上一分钟的真实累计带宽做告警判断
+  // 写入后：对本次写入的每个分钟查 D1 累计值做告警判断
+  // 传入本次涉及的分钟集合，确保不错过任何峰值分钟
   if (c.alertThresholdMbps !== null || c.alertSpikeMultiplier !== null) {
-    checkAndAlertFromD1(env).catch(err =>
+    const minutesWritten = new Set(
+      [...minuteMap.keys()].map(k => k.slice(0, k.indexOf('\x00')))
+    );
+    checkAndAlertFromD1(minutesWritten, env).catch(err =>
       log(env, 'warn', `Alert check failed: ${err.message}`)
     );
   }
@@ -257,35 +262,31 @@ async function flushToD1(minuteMap, env) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// 告警：查 D1 上一完整分钟的真实累计带宽
-// 上一分钟 = 当前分钟 - 1，所有文件都已写完，值最准确
+// 告警：查 D1 本次写入涉及的每个分钟的真实累计带宽
+// 传入 minutesWritten（本次 processFile 写入的分钟集合），
+// 对每个分钟都检查一遍，确保不错过任何峰值
 // ═══════════════════════════════════════════════════════════════
-async function checkAndAlertFromD1(env) {
+async function checkAndAlertFromD1(minutesWritten, env) {
   const c = getConfig(env);
-
-  // 上一完整分钟（UTC）
-  const now    = new Date();
-  now.setSeconds(0, 0);
-  now.setMinutes(now.getMinutes() - 1);
-  const prevMinute = now.toISOString().slice(0, 16);
-
   // 24h前（突增检测窗口）
   const since24h = new Date(Date.now() - 24 * 3600 * 1000).toISOString().slice(0, 16);
 
-  // 查上一分钟各 zone 的带宽
-  const rows = (await env.DB.prepare(`
-    SELECT zone,
-           ROUND(CAST(sum_bytes AS REAL) / 60.0 * 8.0 / 1048576.0, 4) AS mbps
-    FROM bw_stats
-    WHERE minute_utc = ?
-    ORDER BY mbps DESC
-  `).bind(prevMinute).all()).results;
+  for (const minute of minutesWritten) {
+    // 查该分钟各 zone 的 D1 累计带宽（写入后的真实值）
+    const rows = (await env.DB.prepare(`
+      SELECT zone,
+             ROUND(CAST(sum_bytes AS REAL) / 60.0 * 8.0 / 1048576.0, 4) AS mbps
+      FROM bw_stats
+      WHERE minute_utc = ?
+      ORDER BY mbps DESC
+    `).bind(minute).all()).results;
 
-  // 并发处理每个 zone 的告警检测，避免大流量多 zone 时串行等待
-  await Promise.allSettled(rows
-    .filter(({ zone, mbps }) => zone !== 'unknown' && mbps > 0)
-    .map(({ zone, mbps }) => checkZoneAlert(zone, mbps, prevMinute, since24h, c, env))
-  );
+    // 并发处理每个 zone 的告警检测
+    await Promise.allSettled(rows
+      .filter(({ zone, mbps }) => zone !== 'unknown' && mbps > 0)
+      .map(({ zone, mbps }) => checkZoneAlert(zone, mbps, minute, since24h, c, env))
+    );
+  }
 }
 
 // ── 单个 zone 的告警检测（并发安全）────────────────────────────
@@ -561,6 +562,35 @@ async function handleApiStatus(request, env) {
     last_done:    lastDone,
     alert_count:  alertCount?.c || 0,
   });
+}
+
+// ═══════════════════════════════════════════════════════════════
+// HTTP Handler：手动触发告警检测（用于测试验证）
+// POST /api/test-alert  可选 body: { "minute": "2026-04-18T16:06" }
+// ═══════════════════════════════════════════════════════════════
+async function handleTestAlert(request, env) {
+  if (request.method !== 'POST') return jsonResponse({ error: 'POST only' }, 405);
+
+  const body = await request.json().catch(() => ({}));
+  // 默认检测 D1 里带宽最高的那一分钟
+  let minute = body.minute;
+  if (!minute) {
+    const row = await env.DB.prepare(
+      `SELECT minute_utc FROM bw_stats ORDER BY sum_bytes DESC LIMIT 1`
+    ).first();
+    minute = row?.minute_utc;
+  }
+  if (!minute) return jsonResponse({ error: 'No data in D1 yet' }, 400);
+
+  const minutesWritten = new Set([minute]);
+  await checkAndAlertFromD1(minutesWritten, env);
+
+  // 查告警是否触发
+  const alerts = (await env.DB.prepare(
+    `SELECT * FROM alert_history ORDER BY alerted_at DESC LIMIT 5`
+  ).all()).results;
+
+  return jsonResponse({ tested_minute: minute, recent_alerts: alerts });
 }
 
 // ═══════════════════════════════════════════════════════════════
