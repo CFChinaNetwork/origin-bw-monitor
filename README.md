@@ -19,7 +19,7 @@ Dashboard chart (query D1 → Chart.js)
 **Key design:**
 - **Event-driven only** — processes new files via R2 Event Notification; no historical backfill
 - **Read-only on R2** — never writes, modifies, or deletes R2 objects
-- **Safe Lag Window** — waits 10 min before processing, ensuring all Logpush files for a given minute have landed
+- **Safe Lag Window** — waits 7 min before processing, ensuring all Logpush files for a given minute have landed
 - **Pending retry** — files too new for the lag window are retried every 20 min via Cron
 
 ## Formula
@@ -94,8 +94,8 @@ Leave empty to disable that alert type.
 | Logpush batch interval | ~60 sec |
 | R2 Event Notification | 2–5 sec |
 | Queue + Worker processing | 5–30 sec |
-| Safe Lag Window | +10 min |
-| **Total chart data lag** | **~12–15 min** |
+| Safe Lag Window | +7 min |
+| **Total chart data lag** | **~10 min** |
 
 ## Documentation
 

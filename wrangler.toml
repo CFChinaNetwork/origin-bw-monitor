@@ -51,7 +51,7 @@ LOG_PREFIX = "logs/"
 
 # Safe Lag Window（分钟）：等待该分钟内所有 Logpush 文件全部落盘
 # 建议不低于 10 分钟
-LAG_MINUTES = "10"
+LAG_MINUTES = "7"
 
 # processing 状态超时（分钟），超时则认为 Worker 崩溃，允许重试
 MAX_PROCESSING_MIN = "15"

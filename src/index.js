@@ -27,7 +27,7 @@ const LOG_LEVELS = { debug: 0, info: 1, warn: 2, error: 3 };
 function getConfig(env) {
   return {
     prefix:           env.LOG_PREFIX        || 'logs/',
-    lagMinutes:       parseInt(env.LAG_MINUTES || '10', 10),
+    lagMinutes:       parseInt(env.LAG_MINUTES || '7', 10),
     retentionDays:    parseInt(env.DATA_RETENTION_DAYS || '7', 10),
     maxProcessingMin: parseInt(env.MAX_PROCESSING_MIN  || '15', 10),
     dashToken:        env.DASHBOARD_TOKEN   || '',
@@ -46,7 +46,7 @@ function getConfig(env) {
 export default {
 
   // Cron 调度：
-  //   */20 * * * *  → 每20分钟重试 pending 状态文件（因 lag 窗口被延迟处理的文件）
+  //   */20 * * * *  → 每20分钟重试 pending 状态文件（因 lag 窗口被推迟处理的文件）
   //   0 2 * * *     → 每天 UTC 02:00 清理 D1 过期数据
   async scheduled(event, env, ctx) {
     if (event.cron === '0 2 * * *') {
@@ -600,7 +600,7 @@ input{width:320px}
   <canvas id="chartBw" height="110"></canvas>
   <p class="foot">
     Source: Logpush → R2 → Workers → D1 → Chart.js
-    &nbsp;|&nbsp;Data lag: ~10–20 min
+    &nbsp;|&nbsp;Data lag: ~10 min
     &nbsp;|&nbsp;Retention: 7 days
     &nbsp;|&nbsp;Last updated: <span id="lu">—</span>
   </p>

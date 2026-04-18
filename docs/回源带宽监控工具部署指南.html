@@ -194,7 +194,7 @@
     <tr><td>Worker → D1</td><td>在同一次 Worker 调用内完成</td><td>毫秒级</td></tr>
     <tr><td>链路总延迟</td><td>Logpush(~60s) + Event(~5s) + Queue(~15s) + 处理(~30s)</td><td><strong>约 2 分钟</strong></td></tr>
     <tr><td>Safe Lag Window</td><td>额外等待，确保该分钟所有文件都已落盘</td><td><strong>+10 分钟</strong></td></tr>
-    <tr><td><strong>图表数据延迟</strong></td><td>从请求发生到图表可见的总延迟</td><td><strong>约 12~15 分钟</strong></td></tr>
+    <tr><td><strong>图表数据延迟</strong></td><td>从请求发生到图表可见的总延迟</td><td><strong>约 10 分钟</strong></td></tr>
   </tbody>
 </table>
 
@@ -204,7 +204,7 @@
 
 <p><strong>幂等累加写入：</strong>D1 写入使用 <code>INSERT ... ON CONFLICT DO UPDATE SET sum_bytes = sum_bytes + excluded.sum_bytes</code>。同一分钟内来自多个文件的数据会被正确累加。如果文件被重试，<code>processed_files</code> 状态检查会防止重复计算。</p>
 
-<p><strong>R2 Event Notification 为主要触发器：</strong>无需每 N 分钟轮询 R2，R2 Event Notification 实现近实时处理。Cron 触发器（每10分钟）仅作为兜底保障——应对偶尔遗漏的 Event Notification。</p>
+<p><strong>R2 Event Notification 为主要触发器：</strong>无需每 N 分钟轮询 R2，R2 Event Notification 实现近实时处理。辅助 Cron（每20分钟）重试因 lag 窗口被推迟处理的 pending 文件，确保数据完整。</p>
 
 <p><strong>Safe Lag Window（安全延迟窗口）：</strong>跳过 <code>now - LAG_MINUTES</code> 之后写入的文件，确保某一分钟内的所有 Logpush 文件都已落盘再开始聚合，避免统计结果不完整。</p>
 
@@ -275,7 +275,7 @@ START_TIME = "2026-04-01T00:00:00Z"   # ← 只处理此时间点之后的文件
   <li>设置：Event type = <code>object-create</code>，Queue = <code>bw-ingest-queue</code></li>
   <li>可选：Prefix = <code>logs/</code>，Suffix = <code>.gz</code>（只触发 Logpush 文件）</li>
 </ol>
-<div class="note"><strong>重要：</strong>不配置 R2 Event Notification 时，Worker 仅在每10分钟的 Cron 时触发。强烈建议配置 Event Notification 以实现及时处理。</div>
+<div class="note"><strong>重要：</strong>不配置 R2 Event Notification 时，新文件最多等待 20 分钟（Cron 间隔）才会被处理。强烈建议配置 Event Notification 以实现及时处理。</div>
 
 <h3>步骤6 — 设置 Dashboard 鉴权 Token（可选）</h3>
 <pre><code># 留空 = 不鉴权（仅本地开发）
@@ -302,7 +302,7 @@ curl "https://origin-bw-monitor.&lt;子域名&gt;.workers.dev/api/status"
   <tbody>
     <tr><td><code>LOG_PREFIX</code></td><td><code>logs/</code></td><td><span class="badge badge-req">必填</span></td><td>R2 桶内 Logpush 文件的路径前缀，必须与您的 Logpush 任务配置一致。</td></tr>
     <tr><td><code>START_TIME</code></td><td><code>1970-01-01T00:00:00Z</code></td><td><span class="badge badge-req">必填</span></td><td>只处理此 UTC 时间点之后写入 R2 的文件。首次部署时建议设置为近期日期，避免处理数月的历史数据。</td></tr>
-    <tr><td><code>LAG_MINUTES</code></td><td><code>10</code></td><td><span class="badge badge-opt">可选</span></td><td>安全延迟窗口（分钟）。跳过 <code>now - LAG_MINUTES</code> 之后的文件，确保该分钟内所有 Logpush 文件已落盘。建议不低于 5 分钟。</td></tr>
+    <tr><td><code>LAG_MINUTES</code></td><td><code>7</code></td><td><span class="badge badge-opt">可选</span></td><td>安全延迟窗口（分钟）。跳过 <code>now - LAG_MINUTES</code> 之后的文件，确保该分钟内所有 Logpush 文件已落盘。建议不低于 5 分钟。</td></tr>
     <tr><td><code>SCAN_BATCH_SIZE</code></td><td><code>20</code></td><td><span class="badge badge-opt">可选</span></td><td>Cron 每次最多入队的文件数量。防止大量历史文件一次性涌入 Queue。手动导入历史数据请使用 <code>/api/import</code>。</td></tr>
     <tr><td><code>MAX_PROCESSING_MIN</code></td><td><code>15</code></td><td><span class="badge badge-opt">可选</span></td><td>处理超时阈值（分钟）。如果一个文件在 <code>processing</code> 状态超过此时长，认为 Worker 已崩溃，文件将被重新入队。</td></tr>
     <tr><td><code>DATA_RETENTION_DAYS</code></td><td><code>7</code></td><td><span class="badge badge-opt">可选</span></td><td>D1 数据保留天数。超过此天数的数据每日 UTC 02:00 自动删除。</td></tr>

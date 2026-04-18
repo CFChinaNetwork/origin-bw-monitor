@@ -85,7 +85,7 @@
     <tr><td><strong>Deployment</strong></td><td>Deployed in <strong>your own Cloudflare account</strong> — no cross-account access, no external servers</td></tr>
     <tr><td><strong>R2 Access</strong></td><td>Read-only via R2 Binding — <strong>never writes to your R2</strong></td></tr>
     <tr><td><strong>Data Retention</strong></td><td>7 days (configurable), auto-cleaned daily</td></tr>
-    <tr><td><strong>Chart Lag</strong></td><td>~12–15 minutes (Safe Lag Window ~10 min + processing ~2 min)</td></tr>
+    <tr><td><strong>Chart Lag</strong></td><td>~10 minutes (Safe Lag Window 7 min + processing ~2 min)</td></tr>
   </tbody>
 </table>
 
@@ -192,8 +192,8 @@
     <tr><td>Queue → Worker</td><td>Event-driven: Worker wakes on <code>max_batch_size=3</code> or <code>max_batch_timeout=30s</code></td><td>3–15 seconds</td></tr>
     <tr><td>Worker → D1</td><td>Within the same Worker invocation</td><td>Milliseconds</td></tr>
     <tr><td>Total end-to-end</td><td>Logpush (~60s) + Event Notification (~5s) + Queue (~15s) + Processing (~30s)</td><td><strong>~2 minutes</strong></td></tr>
-    <tr><td>Safe Lag Window</td><td>Additional buffer to ensure all files for a given minute have landed</td><td><strong>+10 minutes</strong></td></tr>
-    <tr><td><strong>Chart data lag</strong></td><td>Total from request to visible on chart</td><td><strong>~12–15 minutes</strong></td></tr>
+    <tr><td>Safe Lag Window</td><td>Additional buffer to ensure all files for a given minute have landed</td><td><strong>+7 minutes</strong></td></tr>
+    <tr><td><strong>Chart data lag</strong></td><td>Total from request to visible on chart</td><td><strong>~10 minutes</strong></td></tr>
   </tbody>
 </table>
 
@@ -302,7 +302,7 @@ curl "https://origin-bw-monitor.&lt;subdomain&gt;.workers.dev/api/status"
   <tbody>
     <tr><td><code>LOG_PREFIX</code></td><td><code>logs/</code></td><td><span class="badge badge-req">Required</span></td><td>Path prefix inside R2 for Logpush files. Must match your Logpush job configuration.</td></tr>
     <tr><td><code>START_TIME</code></td><td><code>1970-01-01T00:00:00Z</code></td><td><span class="badge badge-req">Required</span></td><td>Only process R2 files written after this UTC timestamp. Set to your desired analysis start date to avoid processing months of historical data on first deploy.</td></tr>
-    <tr><td><code>LAG_MINUTES</code></td><td><code>10</code></td><td><span class="badge badge-opt">Optional</span></td><td>Safe Lag Window in minutes. Files newer than <code>now - LAG_MINUTES</code> are skipped to ensure all Logpush files for a given minute have landed in R2. Do not set below 5.</td></tr>
+    <tr><td><code>LAG_MINUTES</code></td><td><code>7</code></td><td><span class="badge badge-opt">Optional</span></td><td>Safe Lag Window in minutes. Files newer than <code>now - LAG_MINUTES</code> are skipped to ensure all Logpush files for a given minute have landed in R2. Do not set below 5.</td></tr>
     <tr><td><code>SCAN_BATCH_SIZE</code></td><td><code>20</code></td><td><span class="badge badge-opt">Optional</span></td><td>Max files to enqueue per Cron run. Controls max files retried per Cron run.</td></tr>
     <tr><td><code>MAX_PROCESSING_MIN</code></td><td><code>15</code></td><td><span class="badge badge-opt">Optional</span></td><td>If a file stays in <code>processing</code> status for longer than this (minutes), it is assumed the Worker crashed and the file is re-queued.</td></tr>
     <tr><td><code>DATA_RETENTION_DAYS</code></td><td><code>7</code></td><td><span class="badge badge-opt">Optional</span></td><td>D1 data retention in days. Older data is deleted daily at UTC 02:00 by the cleanup Cron.</td></tr>
