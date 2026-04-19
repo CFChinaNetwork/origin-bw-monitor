@@ -717,9 +717,14 @@ async function loadChart(){
       scales:{
         x:{ticks:{color:'#777',maxTicksLimit:12,maxRotation:0,
           callback:function(value,index,ticks){
-            const label=this.getLabelForValue(value);
+            // ticks[index].label 比 getLabelForValue 更可靠
+            // 格式：'2026-04-18 09:26 UTC+8'
+            const label=(ticks[index]&&ticks[index].label)||'';
+            if(!label)return '';
             if(index===0||index===ticks.length-1)return label;
-            const parts=label.split(' ');return parts[1]+' '+parts[2];
+            // 中间点只显示时间部分：'09:26 UTC+8'
+            const sp=label.split(' ');
+            return(sp[1]||'')+' '+(sp[2]||'');
           }},grid:{color:'#1a1a1a'}},
         y:{ticks:{color:'#777',callback:v=>v+' Mbps'},grid:{color:'#1a1a1a'},beginAtZero:true}
       },
