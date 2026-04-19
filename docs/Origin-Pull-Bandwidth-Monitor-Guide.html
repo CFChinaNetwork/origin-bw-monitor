@@ -16,7 +16,8 @@
   .header h1 { font-size: 24px; font-weight: 800; color: var(--orange); margin-bottom: 4px; }
   .header .sub { font-size: 12px; color: #888; letter-spacing: 0.5px; }
   nav { background: var(--dark); border-top: 1px solid #2a2a3e; padding: 10px 48px;
-        display: flex; gap: 24px; font-size: 12px; }
+        display: flex; gap: 24px; font-size: 12px; flex-wrap: wrap;
+        position: sticky; top: 0; z-index: 100; }
   nav a { color: #aaa; text-decoration: none; } nav a:hover { color: var(--orange); }
   .main { max-width: 960px; margin: 0 auto; padding: 40px 48px; }
   h2 { font-size: 18px; font-weight: 800; color: var(--dark); padding: 10px 16px;
@@ -41,9 +42,10 @@
   .badge { display: inline-block; padding: 2px 8px; border-radius: 3px; font-size: 11px; font-weight: 700; }
   .badge-req { background: #fde8d8; color: #b94a00; border: 1px solid #f6c5a0; }
   .badge-opt { background: #e6f4ea; color: #1e7e34; border: 1px solid #b7dfbf; }
+  /* Architecture diagram: monospace + horizontal scroll + no word wrap */
   .arch-box { background: var(--dark); color: #e0e0e0; border-radius: 8px; padding: 24px;
-              font-family: 'Courier New', monospace; font-size: 12.5px; line-height: 1.8;
-              overflow-x: auto; margin: 16px 0; }
+              font-family: 'Courier New', 'Menlo', monospace; font-size: 12px; line-height: 1.7;
+              overflow-x: auto; margin: 16px 0; white-space: pre; }
   .arch-box .step { color: var(--orange); font-weight: 700; }
   .arch-box .comment { color: #888; }
   .note { background: #fff8f2; border-left: 4px solid var(--orange); padding: 10px 16px;
@@ -66,8 +68,9 @@
   <a href="#formula">Formula</a>
   <a href="#deploy">Deployment</a>
   <a href="#config">Configuration</a>
-  <a href="#import">Import Historical Data</a>
   <a href="#ops">Operations</a>
+  <a href="#screenshot">Dashboard Example</a>
+  <a href="#alerts">Alert Examples</a>
 </nav>
 
 <div class="main">
@@ -203,7 +206,7 @@
 
 <p><strong>Idempotent Accumulative Writes:</strong> D1 writes use <code>INSERT ... ON CONFLICT DO UPDATE SET sum_bytes = sum_bytes + excluded.sum_bytes</code>. Multiple files covering the same minute accumulate correctly. If a file is retried, the <code>processed_files</code> status check prevents double-counting.</p>
 
-<p><strong>R2 Event Notification as Primary Trigger:</strong> Rather than polling R2 every N minutes, we rely on R2 Event Notifications for near-real-time processing. A secondary Cron (<code>*/20 * * * *</code>) retries files that were deferred due to the Safe Lag Window.</p>
+<p><strong>R2 Event Notification as Primary Trigger:</strong> Rather than polling R2 every N minutes, we rely on R2 Event Notifications for near-real-time processing. A secondary Cron (<code>*/8 * * * *</code>) retries files that were deferred due to the Safe Lag Window.</p>
 
 <p><strong>Safe Lag Window:</strong> Files newer than <code>now - LAG_MINUTES</code> are skipped. This ensures that all Logpush files covering a given minute have been written to R2 before we start aggregating that minute. Without this, the last few minutes of data would be incomplete.</p>
 
@@ -264,8 +267,7 @@ bucket_name = "your-logpush-bucket"   # ← your actual R2 bucket name
 database_id = "xxxxxxxx-..."          # ← from Step 1
 
 [vars]
-LOG_PREFIX = "logs/"                  # ← Logpush path prefix (usually "logs/")
-START_TIME = "2026-04-01T00:00:00Z"   # ← only process files after this UTC time</code></pre>
+LOG_PREFIX = "logs/"                  # ← Logpush path prefix (usually "logs/")</code></pre>
 
 <h3>Step 5 — Configure R2 Event Notification</h3>
 <p>This is the primary trigger that enables near-real-time processing.</p>
@@ -301,7 +303,6 @@ curl "https://origin-bw-monitor.&lt;subdomain&gt;.workers.dev/api/status"
   <thead><tr><th>Variable</th><th>Default</th><th>Required</th><th>Description</th></tr></thead>
   <tbody>
     <tr><td><code>LOG_PREFIX</code></td><td><code>logs/</code></td><td><span class="badge badge-req">Required</span></td><td>Path prefix inside R2 for Logpush files. Must match your Logpush job configuration.</td></tr>
-    <tr><td><code>START_TIME</code></td><td><code>1970-01-01T00:00:00Z</code></td><td><span class="badge badge-req">Required</span></td><td>Only process R2 files written after this UTC timestamp. Set to your desired analysis start date to avoid processing months of historical data on first deploy.</td></tr>
     <tr><td><code>LAG_MINUTES</code></td><td><code>7</code></td><td><span class="badge badge-opt">Optional</span></td><td>Safe Lag Window in minutes. Files newer than <code>now - LAG_MINUTES</code> are skipped to ensure all Logpush files for a given minute have landed in R2. Do not set below 5.</td></tr>
     <tr><td><code>SCAN_BATCH_SIZE</code></td><td><code>20</code></td><td><span class="badge badge-opt">Optional</span></td><td>Max files to enqueue per Cron run. Controls max files retried per Cron run.</td></tr>
     <tr><td><code>MAX_PROCESSING_MIN</code></td><td><code>15</code></td><td><span class="badge badge-opt">Optional</span></td><td>If a file stays in <code>processing</code> status for longer than this (minutes), it is assumed the Worker crashed and the file is re-queued.</td></tr>
@@ -315,37 +316,8 @@ curl "https://origin-bw-monitor.&lt;subdomain&gt;.workers.dev/api/status"
 <p>The repo includes <code>.github/workflows/deploy.yml</code>. Any push to <code>main</code> triggers automatic deployment.</p>
 <p>Required GitHub secret: <code>CLOUDFLARE_API_TOKEN</code> (Workers Deploy permission).</p>
 
-<!-- ── 6. Import Historical Data ── -->
-<h2 id="import"><span class="num">6</span> Importing Historical Data</h2>
-
-<p>The Cron trigger processes new files as they arrive. To import historical files (e.g., the past 30 days), use the <code>/api/import</code> endpoint, which reads directly from R2 via the R2 Binding.</p>
-
-<h3>Basic Import (first page)</h3>
-<pre><code>curl -X POST "https://origin-bw-monitor.&lt;subdomain&gt;.workers.dev/api/import" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "from_time": "2026-04-01T00:00:00Z",
-    "page_size": 50
-  }'</code></pre>
-
-<h3>Paginated Import</h3>
-<p>If the response shows <code>"truncated": true</code>, continue with the returned <code>next_cursor</code>:</p>
-<pre><code>curl -X POST ".../api/import" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "from_time": "2026-04-01T00:00:00Z",
-    "page_size": 50,
-    "cursor": "&lt;next_cursor_from_previous_response&gt;"
-  }'</code></pre>
-<p>Repeat until <code>"truncated": false</code>. Recommend 30-second intervals between requests to avoid overwhelming the Queue.</p>
-
-<h3>Monitor Progress</h3>
-<pre><code>curl "https://origin-bw-monitor.&lt;subdomain&gt;.workers.dev/api/status"</code></pre>
-
-<p><strong>Throughput estimate:</strong> The Worker processes approximately 1 file per second (limited by R2 Binding read speed and CPU). For a large history import (e.g., 5,000 files), expect approximately 1–2 hours.</p>
-
-<!-- ── 7. Operations ── -->
-<h2 id="ops"><span class="num">7</span> Operations</h2>
+<!-- ── 6. Operations ── -->
+<h2 id="ops"><span class="num">6</span> Operations</h2>
 
 <h3>Health Check — Key Indicators</h3>
 <table>
@@ -364,7 +336,6 @@ curl "https://origin-bw-monitor.&lt;subdomain&gt;.workers.dev/api/status"
   <tbody>
     <tr><td><code>/</code></td><td>GET</td><td>Dashboard chart UI</td></tr>
     <tr><td><code>/api/stats?zone=&amp;hours=</code></td><td>GET</td><td>Bandwidth data as JSON</td></tr>
-    <tr><td><code>/api/import</code></td><td>POST</td><td>Manually enqueue R2 files for processing (paginated)</td></tr>
     <tr><td><code>/api/status</code></td><td>GET</td><td>System status: file counts, data range, config</td></tr>
     <tr><td><code>/api/retry</code></td><td>POST</td><td>Re-queue up to 50 failed files</td></tr>
   </tbody>
@@ -376,20 +347,20 @@ curl "https://origin-bw-monitor.&lt;subdomain&gt;.workers.dev/api/status"
 <pre><code>[INFO] Processing: logs/20260414/20260414T100000Z_abc.log.gz
 [INFO] Done: logs/20260414/... | lines=87234 lag=0 filter=83891 err=0 minutes=11</code></pre>
 
-<h3>Reset and Re-import</h3>
+<h3>Reset</h3>
 <pre><code># Clear all data and start fresh
 wrangler d1 execute bw-stats \
   --command="DELETE FROM bw_stats; DELETE FROM processed_files;" \
   --remote
 
-# Then re-import using /api/import as described in Section 6</code></pre>
+# New files will be processed automatically via R2 Event Notifications</code></pre>
 
 </div>
 
 <!-- ── Dashboard Screenshot ── -->
-<h2 id="screenshot"><span class="num">8</span> Dashboard Example</h2>
+<h2 id="screenshot"><span class="num">7</span> Dashboard Example</h2>
 
-<p>After successful deployment and data import, the Dashboard will display a per-minute origin pull bandwidth chart similar to the following:</p>
+<p>After successful deployment, once Logpush files start arriving, the Dashboard will display a per-minute origin pull bandwidth chart similar to the following:</p>
 
 <div style="margin:16px 0;border:1px solid var(--border);border-radius:8px;overflow:hidden;">
   <img src="dashboard-screenshot.png" alt="CF Origin Pull Bandwidth Monitor Dashboard Screenshot"
@@ -403,6 +374,7 @@ wrangler d1 execute bw-stats \
 
 <!-- ── Alert Examples ── -->
 <h2 id="alerts"><span class="num">8</span> Alert Examples</h2>
+
 
 <p>When bandwidth exceeds the configured threshold or spikes above the multiplier, alerts are automatically sent to the configured webhook channels. Below is an example of how DingTalk (钉钉) alerts appear:</p>
 
