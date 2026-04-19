@@ -736,11 +736,10 @@ async function loadChart(){
       responsive:true,interaction:{mode:'index',intersect:false},
       scales:{
         x:{ticks:{color:'#777',maxRotation:0,autoSkip:false,
-          // 标签已在数据处理时按间隔生成，空字符串表示不显示，直接透传
-         callback:function(value){
-           const label=this.getLabelForValue(value);
-           return label||null;
-         },grid:{color:'#1a1a1a'}},
+           callback:function(value){
+             const label=this.getLabelForValue(value);
+             return label||null;
+           }},grid:{color:'#1a1a1a'}},
         y:{ticks:{color:'#777',callback:v=>v+' Mbps'},grid:{color:'#1a1a1a'},beginAtZero:true}
       },
       plugins:{
