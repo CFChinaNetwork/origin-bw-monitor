@@ -4,3 +4,17 @@ dist/
 .env
 .env.*
 *.local
+
+# macOS
+.DS_Store
+
+# 本地真实配置（如果有人想在本地跑真实值而不想提交，可命名为 wrangler.local.toml）
+wrangler.local.toml
+
+# 测试产物
+*.db
+/tmp/
+
+# D1 备份文件（可能含真实域名/数据，不得提交）
+backups/
+wrangler.toml.bak

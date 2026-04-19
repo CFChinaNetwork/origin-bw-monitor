@@ -1,9 +1,13 @@
 -- 分钟级带宽聚合表（只存带宽，回源请求数由 CF 控制台 Origin Status Code Tab 提供）
+-- 幂等设计：主键包含 r2_key，每个文件的贡献独立存储
+-- Queue 重试/Worker 崩溃重跑同一文件时，INSERT OR REPLACE 会覆盖而非累加，保证数据不翻倍
+-- 查询时用 SUM() 按 (minute_utc, zone) 聚合得到真实带宽
 CREATE TABLE IF NOT EXISTS bw_stats (
     minute_utc  TEXT    NOT NULL,
     zone        TEXT    NOT NULL DEFAULT 'all',
+    r2_key      TEXT    NOT NULL DEFAULT '',
     sum_bytes   INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (minute_utc, zone)
+    PRIMARY KEY (minute_utc, zone, r2_key)
 );
 
 -- 文件处理状态表

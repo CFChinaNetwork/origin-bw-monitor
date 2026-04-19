@@ -166,8 +166,9 @@ async function processFile(key, env) {
   }
 
   // 有行被 lag 过滤 = 文件包含当前 lag 窗口内的数据，需要稍后重试补全
-  // 无论是否有其他行已处理，都重置为 pending 等 Cron 重试
-  // 注意：已写入 D1 的部分数据不受影响（累加 upsert 是幂等的）
+  // 重置为 pending 等 Cron 重试；此时不 flush，等下次完整重新处理
+  // 幂等保证：即使此处已有部分数据写入（不会发生，此处 return 前未调用 flush），
+  //          下次重试时 INSERT OR REPLACE 会按 r2_key 覆盖，不会累加
   if (skippedLag > 0) {
     await env.DB.prepare(
       `UPDATE processed_files SET status='pending', error_msg='has_lag_retry' WHERE r2_key=?`
@@ -176,7 +177,7 @@ async function processFile(key, env) {
     return;
   }
 
-  await flushToD1(minuteMap, env);
+  await flushToD1(minuteMap, key, env);
 
   // 写入后：对本次写入的每个分钟查 D1 累计值做告警判断
   // 传入本次涉及的分钟集合，确保不错过任何峰值分钟
@@ -239,9 +240,12 @@ function applyFormula(line, minuteMap, safeCutoffMs) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// 批量写入 D1（累加 upsert）
+// 批量写入 D1（真正幂等：INSERT OR REPLACE 按 r2_key 覆盖）
+// 每个文件的贡献以 (minute_utc, zone, r2_key) 为主键独立存储
+// 即使同一文件被重复处理（Queue 重试、Worker 崩溃重跑），写入结果始终一致
+// 查询时用 SUM() 按 (minute_utc, zone) 聚合得到真实带宽
 // ═══════════════════════════════════════════════════════════════
-async function flushToD1(minuteMap, env) {
+async function flushToD1(minuteMap, r2Key, env) {
   if (minuteMap.size === 0) return;
   const entries = [...minuteMap.entries()];
   const CHUNK   = 80;
@@ -251,11 +255,9 @@ async function flushToD1(minuteMap, env) {
       const minute = mapKey.slice(0, idx);
       const zone   = mapKey.slice(idx + 1);
       return env.DB.prepare(`
-        INSERT INTO bw_stats (minute_utc, zone, sum_bytes)
-        VALUES (?, ?, ?)
-        ON CONFLICT(minute_utc, zone) DO UPDATE SET
-          sum_bytes = sum_bytes + excluded.sum_bytes
-      `).bind(minute, zone, v.sum);
+        INSERT OR REPLACE INTO bw_stats (minute_utc, zone, r2_key, sum_bytes)
+        VALUES (?, ?, ?, ?)
+      `).bind(minute, zone, r2Key, v.sum);
     });
     await env.DB.batch(stmts);
   }
@@ -272,12 +274,13 @@ async function checkAndAlertFromD1(minutesWritten, env) {
   const since24h = new Date(Date.now() - 24 * 3600 * 1000).toISOString().slice(0, 16);
 
   for (const minute of minutesWritten) {
-    // 查该分钟各 zone 的 D1 累计带宽（写入后的真实值）
+    // 查该分钟各 zone 的 D1 累计带宽（SUM 聚合所有 r2_key 贡献，得到真实总值）
     const rows = (await env.DB.prepare(`
       SELECT zone,
-             ROUND(CAST(sum_bytes AS REAL) / 60.0 * 8.0 / 1048576.0, 4) AS mbps
+             ROUND(CAST(SUM(sum_bytes) AS REAL) / 60.0 * 8.0 / 1048576.0, 4) AS mbps
       FROM bw_stats
       WHERE minute_utc = ?
+      GROUP BY zone
       ORDER BY mbps DESC
     `).bind(minute).all()).results;
 
@@ -308,10 +311,14 @@ async function checkZoneAlert(zone, mbps, prevMinute, since24h, c, env) {
 
   // 告警2：突增检测
   if (c.alertSpikeMultiplier !== null) {
+    // 先按 minute 聚合 SUM（所有 r2_key 贡献），再取 MAX，得到真实历史峰值
     const row = await env.DB.prepare(`
-      SELECT MAX(ROUND(CAST(sum_bytes AS REAL)/60.0*8.0/1048576.0,4)) AS peak
-      FROM bw_stats
-      WHERE zone = ? AND minute_utc >= ? AND minute_utc < ?
+      SELECT MAX(mbps) AS peak FROM (
+        SELECT ROUND(CAST(SUM(sum_bytes) AS REAL)/60.0*8.0/1048576.0,4) AS mbps
+        FROM bw_stats
+        WHERE zone = ? AND minute_utc >= ? AND minute_utc < ?
+        GROUP BY minute_utc
+      )
     `).bind(zone, since24h, prevMinute).first();
 
     const peak = row?.peak || 0;
@@ -570,9 +577,15 @@ async function handleApiStatus(request, env) {
 // ═══════════════════════════════════════════════════════════════
 async function handleDashboard(request, env) {
   const url   = new URL(request.url);
-  const zone  = url.searchParams.get('zone')  || '';
-  const hours = url.searchParams.get('hours') || '24';
-  const token = url.searchParams.get('token') || '';
+  // XSS 防御：所有用户输入都经 escape 或白名单验证后才嵌入 HTML
+  const rawZone  = url.searchParams.get('zone')  || '';
+  const rawHours = url.searchParams.get('hours') || '24';
+  // hours 白名单（只允许预定义的 5 个选项）
+  const allowedHours = ['1', '6', '24', '72', '168'];
+  const hours = allowedHours.includes(rawHours) ? rawHours : '24';
+  // zone：HTML escape 后才能安全嵌入 HTML 属性
+  const zone  = escapeHtml(rawZone);
+  // token：完全不嵌入 HTML，改由客户端 JS 从 URL 参数动态读取（见 <script> 内 readToken()）
 
   const html = `<!DOCTYPE html>
 <html lang="en">
@@ -642,7 +655,9 @@ input{width:320px}
   </p>
 </div>
 <script>
-const TOKEN='${token}';
+// Token 不从服务端模板注入（防 XSS），改为客户端从当前 URL 读取
+// 服务端模板里绝不拼接用户可控字符串到 JS context
+const TOKEN=(new URLSearchParams(location.search)).get('token')||'';
 const HDRS=TOKEN?{Authorization:'Bearer '+TOKEN}:{};
 let chart=null;
 function toUTC8(m){
@@ -750,7 +765,29 @@ loadChart().then(() => startAutoRefresh());
 </script>
 </body></html>`;
 
-  return new Response(html, { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
+  // CSP：浏览器层兜底防御，即使有注入也无法执行外部/内联任意脚本
+  // - default-src 'self': 默认只允许本站资源
+  // - script-src: 允许 Chart.js CDN + 本模板自身的内联脚本（通过 'unsafe-inline' 有妥协，后续迁移到 nonce 或独立 .js 文件）
+  // - style-src: 内联 style 标签需 'unsafe-inline'
+  // - img-src 'self' data: : 允许本站图片和 data URI
+  // - connect-src: API 请求限制在本站
+  const csp = [
+    "default-src 'self'",
+    "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net",
+    "style-src 'self' 'unsafe-inline'",
+    "img-src 'self' data:",
+    "connect-src 'self'",
+    "frame-ancestors 'none'",
+    "base-uri 'self'",
+  ].join('; ');
+  return new Response(html, {
+    headers: {
+      'Content-Type': 'text/html;charset=UTF-8',
+      'Content-Security-Policy': csp,
+      'X-Content-Type-Options': 'nosniff',
+      'Referrer-Policy': 'no-referrer',
+    },
+  });
 }
 
 // ─── 工具函数 ─────────────────────────────────────────────────
@@ -759,6 +796,14 @@ function jsonResponse(data, status = 200) {
     status,
     headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
   });
+}
+
+// HTML escape：防御 XSS（用于 HTML 文本 + 属性值 context）
+// 覆盖 OWASP 推荐的 5 个字符：& < > " '
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[c]));
 }
 
 function isAuthorized(request, env) {
