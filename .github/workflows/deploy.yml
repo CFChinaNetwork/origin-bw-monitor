@@ -11,6 +11,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Fill in wrangler.toml with secrets
+        run: |
+          sed -i "s/your-logpush-bucket/${{ secrets.R2_BUCKET_NAME }}/g" wrangler.toml
+          sed -i "s/your-d1-database-id/${{ secrets.D1_DATABASE_ID }}/g" wrangler.toml
+
       - name: Deploy with Wrangler
         uses: cloudflare/wrangler-action@v3
         with:
