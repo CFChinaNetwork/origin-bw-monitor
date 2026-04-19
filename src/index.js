@@ -67,8 +67,21 @@ export default {
         await processFile(key, env);
         msg.ack();
       } catch (err) {
-        log(env, 'error', `processFile failed key=${key}: ${err.message}`);
-        msg.retry();
+        // 修复问题 #6：记录失败状态到 processed_files，累加 retry_count
+        // 超过阈值后置为 failed 并 ack（避免无限重试占用 Queue 配额）
+        const maxRetries = 3;
+        await recordFailure(key, err.message, maxRetries, env);
+        const { retry_count } = (await env.DB.prepare(
+          `SELECT retry_count FROM processed_files WHERE r2_key=?`
+        ).bind(key).first()) || { retry_count: 0 };
+
+        if (retry_count >= maxRetries) {
+          log(env, 'error', `processFile failed key=${key} (final, retry=${retry_count}): ${err.message}`);
+          msg.ack();  // 达到重试上限，终止消费，由 DLQ 或人工介入
+        } else {
+          log(env, 'error', `processFile failed key=${key} (retry=${retry_count}): ${err.message}`);
+          msg.retry();
+        }
       }
     }
   },
@@ -240,6 +253,25 @@ function applyFormula(line, minuteMap, safeCutoffMs) {
 }
 
 // ═══════════════════════════════════════════════════════════════
+// 记录文件处理失败（修复问题 #6）
+// 累加 retry_count，达到阈值后置 status='failed'
+// 若记录不存在（消息格式异常时 processFile 未进入 INSERT 就抛错），也插入一条
+// ═══════════════════════════════════════════════════════════════
+async function recordFailure(r2Key, errorMsg, maxRetries, env) {
+  // 截断超长错误信息，避免 D1 存储过大
+  const truncated   = String(errorMsg || 'unknown').slice(0, 500);
+  const initialState = (1 >= maxRetries) ? 'failed' : 'processing';
+  await env.DB.prepare(`
+    INSERT INTO processed_files (r2_key, status, started_at, retry_count, error_msg)
+    VALUES (?, ?, ?, 1, ?)
+    ON CONFLICT(r2_key) DO UPDATE SET
+      retry_count = retry_count + 1,
+      error_msg   = excluded.error_msg,
+      status      = CASE WHEN retry_count + 1 >= ? THEN 'failed' ELSE status END
+  `).bind(r2Key, initialState, new Date().toISOString(), truncated, maxRetries).run();
+}
+
+// ═══════════════════════════════════════════════════════════════
 // 批量写入 D1（真正幂等：INSERT OR REPLACE 按 r2_key 覆盖）
 // 每个文件的贡献以 (minute_utc, zone, r2_key) 为主键独立存储
 // 即使同一文件被重复处理（Queue 重试、Worker 崩溃重跑），写入结果始终一致
@@ -267,11 +299,11 @@ async function flushToD1(minuteMap, r2Key, env) {
 // 告警：查 D1 本次写入涉及的每个分钟的真实累计带宽
 // 传入 minutesWritten（本次 processFile 写入的分钟集合），
 // 对每个分钟都检查一遍，确保不错过任何峰值
+// 修复问题 #8：since24h 改为按"目标分钟往前 24 小时"计算，
+// 而非"当前时间往前 24 小时"，更准确地反映该分钟的历史峰值
 // ═══════════════════════════════════════════════════════════════
 async function checkAndAlertFromD1(minutesWritten, env) {
   const c = getConfig(env);
-  // 24h前（突增检测窗口）
-  const since24h = new Date(Date.now() - 24 * 3600 * 1000).toISOString().slice(0, 16);
 
   for (const minute of minutesWritten) {
     // 查该分钟各 zone 的 D1 累计带宽（SUM 聚合所有 r2_key 贡献，得到真实总值）
@@ -283,6 +315,10 @@ async function checkAndAlertFromD1(minutesWritten, env) {
       GROUP BY zone
       ORDER BY mbps DESC
     `).bind(minute).all()).results;
+
+    // 针对当前 minute 独立计算 24h 窗口（修复问题 #8）
+    const minuteMs   = new Date(minute + ':00Z').getTime();
+    const since24h   = new Date(minuteMs - 24 * 3600 * 1000).toISOString().slice(0, 16);
 
     // 并发处理每个 zone 的告警检测
     await Promise.allSettled(rows
@@ -296,16 +332,16 @@ async function checkAndAlertFromD1(minutesWritten, env) {
 async function checkZoneAlert(zone, mbps, prevMinute, since24h, c, env) {
   // 告警1：固定阈值
   if (c.alertThresholdMbps !== null && mbps >= c.alertThresholdMbps) {
-    const cooldownOk = await checkCooldown('threshold', zone, c.alertCooldownMin, env);
-    if (cooldownOk) {
-      const detail = { threshold: c.alertThresholdMbps, current: mbps };
+    const detail = { threshold: c.alertThresholdMbps, current: mbps };
+    // 原子锁：INSERT WHERE NOT EXISTS，只有最先到达的 Worker 能成功写入并发告警
+    const locked = await tryAcquireAlertLock('threshold', zone, prevMinute, mbps, detail, c.alertCooldownMin, env);
+    if (locked) {
       await sendAlert({
         type: 'threshold', zone, minute: prevMinute, mbps, detail,
         title:   '🚨 CF 回源带宽超阈值告警',
         summary: `当前带宽 **${mbps.toFixed(3)} Mbps** 超过设定阈值 **${c.alertThresholdMbps} Mbps**`,
         dashUrl: c.alertDashboardUrl,
       }, env);
-      await recordAlert('threshold', zone, prevMinute, mbps, detail, env);
     }
   }
 
@@ -323,38 +359,41 @@ async function checkZoneAlert(zone, mbps, prevMinute, since24h, c, env) {
 
     const peak = row?.peak || 0;
     if (peak > 0 && mbps >= peak * c.alertSpikeMultiplier) {
-      const cooldownOk = await checkCooldown('spike', zone, c.alertCooldownMin, env);
-      if (cooldownOk) {
-        const ratio  = (mbps / peak).toFixed(1);
-        const detail = { multiplier: c.alertSpikeMultiplier, current: mbps, historicPeak: peak, ratio };
+      const ratio  = (mbps / peak).toFixed(1);
+      const detail = { multiplier: c.alertSpikeMultiplier, current: mbps, historicPeak: peak, ratio };
+      const locked = await tryAcquireAlertLock('spike', zone, prevMinute, mbps, detail, c.alertCooldownMin, env);
+      if (locked) {
         await sendAlert({
           type: 'spike', zone, minute: prevMinute, mbps, detail,
           title:   '⚡ CF 回源带宽突增告警',
           summary: `当前带宽 **${mbps.toFixed(3)} Mbps**，是过去24小时最高值 **${peak.toFixed(3)} Mbps** 的 **${ratio} 倍**`,
           dashUrl: c.alertDashboardUrl,
         }, env);
-        await recordAlert('spike', zone, prevMinute, mbps, detail, env);
       }
     }
   }
 }
 
-// ── 冷却检查 ──────────────────────────────────────────────────
-async function checkCooldown(alertType, zone, cooldownMin, env) {
-  const since = new Date(Date.now() - cooldownMin * 60 * 1000).toISOString();
-  const row = await env.DB.prepare(`
-    SELECT id FROM alert_history
-    WHERE alert_type=? AND zone=? AND alerted_at>=? LIMIT 1
-  `).bind(alertType, zone, since).first();
-  return !row;
-}
-
-// ── 记录告警历史 ──────────────────────────────────────────────
-async function recordAlert(alertType, zone, minute, mbps, detail, env) {
-  await env.DB.prepare(`
+// ── 告警原子锁（修复问题 #7：防止并发重复告警）────────────────
+// 旧逻辑：checkCooldown → sendAlert → recordAlert 三步非原子，并发 Worker 会各自通过检查后都发送
+// 新逻辑：INSERT ... WHERE NOT EXISTS 一次性检查+写入，SQLite/D1 保证语句级原子性
+// 只有最先到达的 Worker 能 INSERT 成功（changes=1），其他 Worker 被 WHERE NOT EXISTS 阻止（changes=0）
+// 权衡：alert_history 先于告警发送写入，若发送失败告警会丢失一个冷却周期（at-most-once，可接受）
+async function tryAcquireAlertLock(alertType, zone, minute, mbps, detail, cooldownMin, env) {
+  const sinceIso = new Date(Date.now() - cooldownMin * 60 * 1000).toISOString();
+  const nowIso   = new Date().toISOString();
+  const result = await env.DB.prepare(`
     INSERT INTO alert_history (alert_type, zone, minute_utc, mbps, detail, alerted_at)
-    VALUES (?, ?, ?, ?, ?, ?)
-  `).bind(alertType, zone, minute, mbps, JSON.stringify(detail), new Date().toISOString()).run();
+    SELECT ?, ?, ?, ?, ?, ?
+    WHERE NOT EXISTS (
+      SELECT 1 FROM alert_history
+      WHERE alert_type = ? AND zone = ? AND alerted_at >= ?
+    )
+  `).bind(
+    alertType, zone, minute, mbps, JSON.stringify(detail), nowIso,
+    alertType, zone, sinceIso
+  ).run();
+  return (result.meta?.changes ?? 0) === 1;
 }
 
 // ── 发送告警（企业微信 / 钉钉 / 飞书，任意组合）──────────────
@@ -387,7 +426,7 @@ async function sendWeCom(url, { title, zone, timeStr, mbps, detail, dashUrl }) {
     content += `> **24h历史峰值：** ${detail.historicPeak.toFixed(3)} Mbps\n`;
     content += `> **当前倍数：** <font color="warning">${detail.ratio} 倍</font>\n`;
   }
-  if (dashUrl) content += `\n[查看监控面板](${dashUrl}?zone=${encodeURIComponent(zone)}&hours=24)`;
+  if (dashUrl) content += `\n[查看监控面板](${buildDashboardUrl(dashUrl, zone)})`;
   await fetch(url, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ msgtype: 'markdown', markdown: { content } }),
@@ -407,7 +446,7 @@ async function sendDingTalk(url, { title, zone, timeStr, mbps, detail, dashUrl }
     msgtype: 'actionCard',
     actionCard: {
       title, text, btnOrientation: '0',
-      btns: dashUrl ? [{ title: '查看监控面板', actionURL: dashUrl + '?zone=' + encodeURIComponent(zone) + '&hours=24' }] : [],
+      btns: dashUrl ? [{ title: '查看监控面板', actionURL: buildDashboardUrl(dashUrl, zone) }] : [],
     },
   };
   await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
@@ -429,7 +468,7 @@ async function sendFeishu(url, { title, zone, timeStr, mbps, detail, dashUrl }) 
   if (dashUrl) elements.push({
     tag: 'action',
     actions: [{ tag: 'button', text: { tag: 'plain_text', content: '查看监控面板' },
-      url: dashUrl + '?zone=' + encodeURIComponent(zone) + '&hours=24', type: 'default' }],
+      url: buildDashboardUrl(dashUrl, zone), type: 'default' }],
   });
   await fetch(url, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -441,28 +480,39 @@ async function sendFeishu(url, { title, zone, timeStr, mbps, detail, dashUrl }) 
 }
 
 // ═══════════════════════════════════════════════════════════════
-// Cron 每20分钟：重试 pending 状态文件
-// pending = 之前因 lag 窗口被推迟，现在 lag 窗口已过，可以重新处理
-// 只重试 started_at 超过 lag 窗口的文件，避免重试刚被设为 pending 的文件
+// Cron 每 8 分钟：重试需要恢复的文件
+// 两类候选：
+//   1. pending 状态 - 之前因 lag 窗口被推迟，现在 lag 窗口已过（原设计）
+//   2. processing 状态且 started_at 超过 MAX_PROCESSING_MIN
+//      = Worker 崩溃/超时后卡死的文件，不重试就永远丢失（Bug #2）
 // ═══════════════════════════════════════════════════════════════
 async function retryPendingFiles(env) {
   const c = getConfig(env);
 
-  // 只重试 started_at 早于 lagMinutes 前的 pending 文件
-  // 即：文件被设为 pending 的时间已经超过 lag 窗口，说明现在可以重新处理了
-  const lagCutoff = new Date(Date.now() - c.lagMinutes * 60 * 1000).toISOString();
+  const nowMs = Date.now();
+  // pending 重试条件：被置为 pending 的时间早于 lag 窗口（lag 已过，可安全重试）
+  const lagCutoff   = new Date(nowMs - c.lagMinutes * 60 * 1000).toISOString();
+  // processing 卡死判定：started_at 已超过 maxProcessingMin，Worker 肯定已经不在处理
+  const stuckCutoff = new Date(nowMs - c.maxProcessingMin * 60 * 1000).toISOString();
 
   const rows = (await env.DB.prepare(
-    `SELECT r2_key FROM processed_files
-     WHERE status = 'pending' AND started_at < ?
+    `SELECT r2_key, status FROM processed_files
+     WHERE (status = 'pending'    AND started_at < ?)
+        OR (status = 'processing' AND started_at < ?)
      ORDER BY started_at ASC LIMIT 20`
-  ).bind(lagCutoff).all()).results;
+  ).bind(lagCutoff, stuckCutoff).all()).results;
 
   if (rows.length === 0) return;
 
-  log(env, 'info', `Cron retry: found ${rows.length} pending files ready for retry`);
-  for (const { r2_key } of rows) {
+  const pendingCount = rows.filter(r => r.status === 'pending').length;
+  const stuckCount   = rows.filter(r => r.status === 'processing').length;
+  log(env, 'info', `Cron retry: ${rows.length} files (pending=${pendingCount}, stuck-processing=${stuckCount})`);
+
+  for (const { r2_key, status } of rows) {
     try {
+      if (status === 'processing') {
+        log(env, 'warn', `Recovering stuck processing file: ${r2_key}`);
+      }
       await processFile(r2_key, env);
     } catch (err) {
       log(env, 'warn', `Retry failed for ${r2_key}: ${err.message}`);
@@ -472,17 +522,43 @@ async function retryPendingFiles(env) {
 
 // ═══════════════════════════════════════════════════════════════
 // D1 数据生命周期清理（每日 UTC 02:00）
+// 修复问题 #4：processed_files 表无限增长
+//   旧逻辑仅清理 'finished_at IS NOT NULL AND finished_at < cutoff'，
+//   任何卡在 pending/processing/failed 永不完成的记录永远不会被清理。
+//   新逻辑：
+//     - 已完成（done）: 按 finished_at 清理
+//     - 未完成（pending/processing/failed）: 按 started_at 清理，但给更长的宽限期
+//       避免误删"刚卡住但还可能恢复"的文件
 // ═══════════════════════════════════════════════════════════════
 async function cleanupOldData(env) {
   const c       = getConfig(env);
+  // 主 cutoff：按保留天数
   const cutoff  = new Date(Date.now() - c.retentionDays * 24 * 3600 * 1000).toISOString().slice(0, 16);
   const cutoffF = new Date(Date.now() - c.retentionDays * 24 * 3600 * 1000).toISOString();
+  // 针对未完成的文件，额外多给 1 天宽限期，避免误删刚卡住的文件
+  const staleCutoffF = new Date(Date.now() - (c.retentionDays + 1) * 24 * 3600 * 1000).toISOString();
+
   log(env, 'info', `Cleanup: retention=${c.retentionDays}d cutoff=${cutoff}`);
   try {
     const r1 = await env.DB.prepare(`DELETE FROM bw_stats WHERE minute_utc < ?`).bind(cutoff).run();
-    const r2 = await env.DB.prepare(`DELETE FROM processed_files WHERE finished_at IS NOT NULL AND finished_at < ?`).bind(cutoffF).run();
+
+    // 清理 processed_files：
+    //   1) 已完成的按 finished_at（原逻辑，保留）
+    //   2) 未完成但 started_at 过于久远的（修复：原逻辑从不清理，导致表无限增长）
+    const r2Done = await env.DB.prepare(
+      `DELETE FROM processed_files WHERE finished_at IS NOT NULL AND finished_at < ?`
+    ).bind(cutoffF).run();
+    const r2Stale = await env.DB.prepare(
+      `DELETE FROM processed_files WHERE finished_at IS NULL AND started_at < ?`
+    ).bind(staleCutoffF).run();
+
     const r3 = await env.DB.prepare(`DELETE FROM alert_history WHERE alerted_at < ?`).bind(cutoffF).run();
-    log(env, 'info', `Cleanup done: bw_stats=${r1.meta?.changes??0} processed_files=${r2.meta?.changes??0} alert_history=${r3.meta?.changes??0}`);
+    log(env, 'info',
+      `Cleanup done: bw_stats=${r1.meta?.changes??0} ` +
+      `processed_files=${(r2Done.meta?.changes??0) + (r2Stale.meta?.changes??0)} ` +
+      `(done=${r2Done.meta?.changes??0}, stale=${r2Stale.meta?.changes??0}) ` +
+      `alert_history=${r3.meta?.changes??0}`
+    );
   } catch (err) { log(env, 'error', `Cleanup failed: ${err.message}`); }
 }
 
@@ -804,6 +880,21 @@ function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
   }[c]));
+}
+
+// 构造 Dashboard 跳转 URL（修复问题 #5）
+// 使用 URL 对象安全处理，支持 dashUrl 本身已包含 query/fragment 的场景
+// 例如用户配置了 https://xxx.workers.dev/?token=abc 也能正确追加 zone/hours 参数
+function buildDashboardUrl(dashUrl, zone) {
+  try {
+    const u = new URL(dashUrl);
+    u.searchParams.set('zone', zone);
+    u.searchParams.set('hours', '24');
+    return u.toString();
+  } catch {
+    // dashUrl 格式异常时回退到原始字符串（至少能显示）
+    return dashUrl;
+  }
 }
 
 function isAuthorized(request, env) {

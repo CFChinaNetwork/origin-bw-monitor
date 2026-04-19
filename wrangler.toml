@@ -22,17 +22,17 @@ crons = ["*/8 * * * *", "0 2 * * *"]
 
 # ── R2 存储桶（与 Logpush 目标桶相同，R2 Binding 只读）────────
 # binding 名称不要修改（index.js 通过此名称访问）
-# bucket_name 改为你的 Logpush R2 桶名
+# 注：bucket_name 和 D1 database_id 本身不是敏感信息（攻击者无 API Token 无法操作），
+#     直接写在此处可简化 CI 部署；真正敏感的是 CLOUDFLARE_API_TOKEN（在 GitHub Secrets 中）
 [[r2_buckets]]
 binding     = "LOGPUSH_BUCKET"
-bucket_name = "your-logpush-bucket"        # ← 替换为实际 R2 桶名
+bucket_name = "cdn-logs-raw"
 
 # ── D1 数据库 ─────────────────────────────────────────────────
-# 先执行 `wrangler d1 create bw-stats` 获取 database_id，填入下方
 [[d1_databases]]
 binding       = "DB"
 database_name = "bw-stats"
-database_id   = "your-d1-database-id"       # ← 替换为 wrangler d1 create 输出的 ID
+database_id   = "a0546e2b-0487-4124-b4ac-6dad1aa079eb"
 
 # ── Queue（由 R2 Event Notification 触发，Worker 消费）────────
 # 注：只需 Consumer，不需要 Producer binding

@@ -11,11 +11,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Fill in wrangler.toml with secrets
-        run: |
-          sed -i "s/your-logpush-bucket/${{ secrets.R2_BUCKET_NAME }}/g" wrangler.toml
-          sed -i "s/your-d1-database-id/${{ secrets.D1_DATABASE_ID }}/g" wrangler.toml
-
+      # bucket_name 和 database_id 已直接写入 wrangler.toml（非敏感信息，无 API Token 无法操作）
+      # 真正敏感的 CLOUDFLARE_API_TOKEN 继续通过 GitHub Secrets 注入
       - name: Deploy with Wrangler
         uses: cloudflare/wrangler-action@v3
         with:
