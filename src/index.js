@@ -737,10 +737,18 @@ async function loadChart(){
       },
       plugins:{
         legend:{labels:{color:'#bbb',font:{size:12}}},
-        tooltip:{callbacks:{label:c=>[
-          'Bandwidth: '+c.parsed.y+' Mbps',
-          'Sum: '+((d[c.dataIndex]?.sum_bytes||0)/1048576).toFixed(2)+' MB',
-        ]}}
+        tooltip:{callbacks:{
+          title:function(items){
+            // tooltip 标题显示当前数据点的 UTC+8 时间
+            const idx=items[0]?.dataIndex;
+            if(idx==null||!d[idx])return '';
+            return fmtUTC8(d[idx].minute_utc);
+          },
+          label:c=>[
+            'Bandwidth: '+c.parsed.y+' Mbps',
+            'Sum: '+((d[c.dataIndex]?.sum_bytes||0)/1048576).toFixed(2)+' MB',
+          ]
+        }}
       }
     }
   });
