@@ -46,7 +46,7 @@ function getConfig(env) {
 export default {
 
   // Cron 调度：
-  //   */20 * * * *  → 每20分钟重试 pending 状态文件（因 lag 窗口被推迟处理的文件）
+  //   */8 * * * *   → 每8分钟重试 pending 状态文件（配合 LAG=7min，总延迟约 10-15min）
   //   0 2 * * *     → 每天 UTC 02:00 清理 D1 过期数据
   async scheduled(event, env, ctx) {
     if (event.cron === '0 2 * * *') {
