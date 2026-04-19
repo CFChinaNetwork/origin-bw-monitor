@@ -23,8 +23,20 @@
 
 const LOG_LEVELS = { debug: 0, info: 1, warn: 2, error: 3 };
 
+// 配置缓存（修复 #15：避免每次 HTTP 请求都重新 parseInt/parseFloat）
+// Worker 冷启动后，env 对象在整个实例生命周期内不变，所以按 env 对象引用做 WeakMap 缓存
+const _configCache = new WeakMap();
+
 // ─── 配置（全部来自 wrangler.toml，不硬编码）─────────────────
 function getConfig(env) {
+  const cached = _configCache.get(env);
+  if (cached) return cached;
+  const config = _buildConfig(env);
+  _configCache.set(env, config);
+  return config;
+}
+
+function _buildConfig(env) {
   return {
     prefix:           env.LOG_PREFIX        || 'logs/',
     lagMinutes:       parseInt(env.LAG_MINUTES || '7', 10),
@@ -32,6 +44,9 @@ function getConfig(env) {
     maxProcessingMin: parseInt(env.MAX_PROCESSING_MIN  || '15', 10),
     dashToken:        env.DASHBOARD_TOKEN   || '',
     logLevel:         env.LOG_LEVEL         || 'info',
+    // Dashboard 显示时区偏移（小时）：默认 UTC+8（中国），可配置为其他时区
+    // 例如 UTC-8（西八区）= -8，UTC+0 = 0，UTC+9（东京/首尔）= 9
+    displayTzOffsetHours: parseInt(env.DISPLAY_TZ_OFFSET_HOURS || '8', 10),
     // 告警配置（留空 = 不启用）
     alertThresholdMbps:   env.ALERT_THRESHOLD_MBPS
       ? parseFloat(env.ALERT_THRESHOLD_MBPS) : null,
@@ -398,10 +413,14 @@ async function tryAcquireAlertLock(alertType, zone, minute, mbps, detail, cooldo
 
 // ── 发送告警（企业微信 / 钉钉 / 飞书，任意组合）──────────────
 async function sendAlert({ type, zone, minute, mbps, detail, title, summary, dashUrl }, env) {
-  const t      = new Date(minute + ':00Z');
-  const cst    = new Date(t.getTime() + 8 * 3600000);
-  const iso    = cst.toISOString();
-  const timeStr = iso.slice(0, 10) + ' ' + iso.slice(11, 16) + ' UTC+8';
+  // 修复 #13：时区可配置（通过 DISPLAY_TZ_OFFSET_HOURS 环境变量）
+  const c       = getConfig(env);
+  const tzHours = c.displayTzOffsetHours;
+  const tzLabel = `UTC${tzHours >= 0 ? '+' : ''}${tzHours}`;
+  const t       = new Date(minute + ':00Z');
+  const local   = new Date(t.getTime() + tzHours * 3600000);
+  const iso     = local.toISOString();
+  const timeStr = iso.slice(0, 10) + ' ' + iso.slice(11, 16) + ' ' + tzLabel;
 
   const tasks = [];
   if (env.ALERT_WEBHOOK_WECOM)    tasks.push(sendWeCom(env.ALERT_WEBHOOK_WECOM, { title, summary, zone, timeStr, mbps, detail, dashUrl }));
@@ -540,56 +559,90 @@ async function cleanupOldData(env) {
 
   log(env, 'info', `Cleanup: retention=${c.retentionDays}d cutoff=${cutoff}`);
   try {
-    const r1 = await env.DB.prepare(`DELETE FROM bw_stats WHERE minute_utc < ?`).bind(cutoff).run();
+    // 修复 #17：分批删除，避免大量过期数据时 D1 单次 DELETE 超时
+    // SQLite 默认不支持 DELETE ... LIMIT，改用 WHERE rowid IN (SELECT ... LIMIT)
+    const r1Count   = await deleteBatched(env,
+      `DELETE FROM bw_stats WHERE rowid IN (SELECT rowid FROM bw_stats WHERE minute_utc < ? LIMIT 5000)`, [cutoff]);
+    const r2DoneC   = await deleteBatched(env,
+      `DELETE FROM processed_files WHERE rowid IN (SELECT rowid FROM processed_files WHERE finished_at IS NOT NULL AND finished_at < ? LIMIT 5000)`, [cutoffF]);
+    const r2StaleC  = await deleteBatched(env,
+      `DELETE FROM processed_files WHERE rowid IN (SELECT rowid FROM processed_files WHERE finished_at IS NULL AND started_at < ? LIMIT 5000)`, [staleCutoffF]);
+    const r3Count   = await deleteBatched(env,
+      `DELETE FROM alert_history WHERE rowid IN (SELECT rowid FROM alert_history WHERE alerted_at < ? LIMIT 5000)`, [cutoffF]);
 
-    // 清理 processed_files：
-    //   1) 已完成的按 finished_at（原逻辑，保留）
-    //   2) 未完成但 started_at 过于久远的（修复：原逻辑从不清理，导致表无限增长）
-    const r2Done = await env.DB.prepare(
-      `DELETE FROM processed_files WHERE finished_at IS NOT NULL AND finished_at < ?`
-    ).bind(cutoffF).run();
-    const r2Stale = await env.DB.prepare(
-      `DELETE FROM processed_files WHERE finished_at IS NULL AND started_at < ?`
-    ).bind(staleCutoffF).run();
-
-    const r3 = await env.DB.prepare(`DELETE FROM alert_history WHERE alerted_at < ?`).bind(cutoffF).run();
     log(env, 'info',
-      `Cleanup done: bw_stats=${r1.meta?.changes??0} ` +
-      `processed_files=${(r2Done.meta?.changes??0) + (r2Stale.meta?.changes??0)} ` +
-      `(done=${r2Done.meta?.changes??0}, stale=${r2Stale.meta?.changes??0}) ` +
-      `alert_history=${r3.meta?.changes??0}`
+      `Cleanup done: bw_stats=${r1Count} ` +
+      `processed_files=${r2DoneC + r2StaleC} (done=${r2DoneC}, stale=${r2StaleC}) ` +
+      `alert_history=${r3Count}`
     );
   } catch (err) { log(env, 'error', `Cleanup failed: ${err.message}`); }
+}
+
+// ─── 分批删除工具（#17 修复）────────────────────────────────
+// 每批删 LIMIT 行，循环直到无更多可删行，防止单条 DELETE 扫描过多行超时
+async function deleteBatched(env, sql, bindings, maxIterations = 100) {
+  let totalDeleted = 0;
+  for (let i = 0; i < maxIterations; i++) {
+    const result = await env.DB.prepare(sql).bind(...bindings).run();
+    const changed = result.meta?.changes ?? 0;
+    totalDeleted += changed;
+    if (changed === 0) break;  // 没有更多可删除的行
+  }
+  return totalDeleted;
 }
 
 // ═══════════════════════════════════════════════════════════════
 // HTTP Handler：带宽统计数据 API
 // ═══════════════════════════════════════════════════════════════
 async function handleApiStats(request, env) {
-  const url   = new URL(request.url);
-  const zone  = url.searchParams.get('zone')  || '%';
-  const hours = parseInt(url.searchParams.get('hours') || '24', 10);
+  const url    = new URL(request.url);
+  const zoneIn = url.searchParams.get('zone');
+  // hours 白名单验证（防止超大值导致性能问题）
+  const rawHours   = url.searchParams.get('hours');
+  const allowedHrs = [1, 6, 24, 72, 168];
+  const hours      = allowedHrs.includes(parseInt(rawHours, 10)) ? parseInt(rawHours, 10) : 24;
 
-  // 时间范围：从 hours 小时前 到 现在-lag（已处理的最新分钟）
+  // 修复 #11：时间范围 off-by-one
+  // 显式向下取整到完整分钟边界，语义比 "减60秒" 更清晰
   const c       = getConfig(env);
   const nowMs   = Date.now();
-  const endMs   = nowMs - c.lagMinutes * 60 * 1000;  // 最新可显示时间点
-  const startMs = nowMs - hours * 3600 * 1000;        // 选定时间范围起点
+  const endMs   = nowMs - c.lagMinutes * 60 * 1000;
+  const startMs = nowMs - hours * 3600 * 1000;
 
   const since  = new Date(startMs).toISOString().slice(0, 16);
-  const endMin = new Date(endMs - 60 * 1000).toISOString().slice(0, 16); // 含最新完整分钟
+  // 向下取整到最后一个"完整"分钟：先 setSeconds(0,0) 取整，再退 1 分钟确保那一分钟的数据已全部落盘
+  const endDate = new Date(endMs);
+  endDate.setSeconds(0, 0);
+  endDate.setMinutes(endDate.getMinutes() - 1);
+  const endMin = endDate.toISOString().slice(0, 16);
 
-  // 按分钟聚合所有 zone（跨 zone 求和），确保每个时间点只有一条数据
-  // 这样无论查单个 zone 还是全部 zone，图表始终只有一条线，标签清晰
-  const rows = await env.DB.prepare(`
-    SELECT minute_utc,
-           SUM(sum_bytes) AS sum_bytes,
-           ROUND(CAST(SUM(sum_bytes) AS REAL)/60.0*8.0/1048576.0, 4) AS mbps
-    FROM bw_stats
-    WHERE minute_utc >= ? AND minute_utc <= ? AND zone LIKE ?
-    GROUP BY minute_utc
-    ORDER BY minute_utc ASC
-  `).bind(since, endMin, zone).all();
+  // 修复 #10：zone 参数用精确匹配（=），防止 %/_ 被当作 LIKE 通配符
+  // 未传 zone 或空串 = 查询全部 zone
+  let query, bindings;
+  if (zoneIn && zoneIn.trim() !== '') {
+    query = `
+      SELECT minute_utc,
+             SUM(sum_bytes) AS sum_bytes,
+             ROUND(CAST(SUM(sum_bytes) AS REAL)/60.0*8.0/1048576.0, 4) AS mbps
+      FROM bw_stats
+      WHERE minute_utc >= ? AND minute_utc <= ? AND zone = ?
+      GROUP BY minute_utc
+      ORDER BY minute_utc ASC
+    `;
+    bindings = [since, endMin, zoneIn];
+  } else {
+    query = `
+      SELECT minute_utc,
+             SUM(sum_bytes) AS sum_bytes,
+             ROUND(CAST(SUM(sum_bytes) AS REAL)/60.0*8.0/1048576.0, 4) AS mbps
+      FROM bw_stats
+      WHERE minute_utc >= ? AND minute_utc <= ?
+      GROUP BY minute_utc
+      ORDER BY minute_utc ASC
+    `;
+    bindings = [since, endMin];
+  }
+  const rows = await env.DB.prepare(query).bind(...bindings).all();
 
   // 补首尾端点，确保横轴覆盖完整所选时间范围
   const dataMap = new Map(rows.results.map(r => [r.minute_utc, r]));
@@ -605,7 +658,7 @@ async function handleApiStats(request, env) {
   return jsonResponse({
     formula: 'SUM(CacheResponseBytes) WHERE OriginStatus NOT IN (0,304) / 60s * 8bits / 1024^2 = Mbps',
     ref:     'https://developers.cloudflare.com/logs/faq/common-calculations/',
-    since, end: endMin, zone,
+    since, end: endMin, zone: zoneIn || '(all)',
     count: rows.results.length,
     data:  finalData,
   });
@@ -663,13 +716,26 @@ async function handleDashboard(request, env) {
   const zone  = escapeHtml(rawZone);
   // token：完全不嵌入 HTML，改由客户端 JS 从 URL 参数动态读取（见 <script> 内 readToken()）
 
+  // 修复 #12 / #13：从配置读取保留天数和显示时区，避免 Dashboard UI 与实际设置不一致
+  const c             = getConfig(env);
+  const retentionDays = c.retentionDays;
+  const tzHours       = c.displayTzOffsetHours;
+  const tzLabel       = `UTC${tzHours >= 0 ? '+' : ''}${tzHours}`;
+  const tzOffsetMs    = tzHours * 3600 * 1000;
+
   const html = `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>CF Origin Pull Bandwidth Monitor</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<!-- #14 修复：Chart.js CDN fallback 链。
+     主 CDN: jsDelivr (国际)
+     备用 1: unpkg (国际)
+     备用 2: cdnjs (Cloudflare, 国内可达)
+     加载失败时依次降级，任一成功即可渲染图表 -->
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"
+  onerror="this.onerror=null;var s=document.createElement('script');s.src='https://unpkg.com/chart.js@4.4.0/dist/chart.umd.min.js';s.onerror=function(){var t=document.createElement('script');t.src='https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js';document.head.appendChild(t);};document.head.appendChild(s);"></script>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
@@ -695,7 +761,7 @@ input{width:320px}
 <p class="sub">
   <code>SUM(CacheResponseBytes) WHERE OriginStatus NOT IN (0,304) ÷ 60s × 8 = Mbps</code>
   &nbsp;—&nbsp;<a href="https://developers.cloudflare.com/logs/faq/common-calculations/" target="_blank">Official Ref</a>
-  &nbsp;|&nbsp;Times in UTC+8
+  &nbsp;|&nbsp;Times in ${tzLabel}
 </p>
 <div class="ctrl">
   <input id="zi" placeholder="Zone hostname (blank = all)" value="${zone}">
@@ -725,7 +791,7 @@ input{width:320px}
   <p class="foot">
     Source: Logpush → R2 → Workers → D1 → Chart.js
     &nbsp;|&nbsp;Data lag: ~10 min
-    &nbsp;|&nbsp;Retention: 7 days
+    &nbsp;|&nbsp;Retention: ${retentionDays} days
     &nbsp;|&nbsp;Auto-refresh: every 60s
     &nbsp;|&nbsp;Last updated: <span id="lu">—</span>
   </p>
@@ -735,10 +801,13 @@ input{width:320px}
 // 服务端模板里绝不拼接用户可控字符串到 JS context
 const TOKEN=(new URLSearchParams(location.search)).get('token')||'';
 const HDRS=TOKEN?{Authorization:'Bearer '+TOKEN}:{};
+// 时区配置由服务端注入（#13 修复：不再硬编码 UTC+8）
+const TZ_OFFSET_MS=${tzOffsetMs};
+const TZ_LABEL=${JSON.stringify(tzLabel)};
 let chart=null;
-function toUTC8(m){
-  const t=new Date(m+':00Z'),c=new Date(t.getTime()+8*3600000),i=c.toISOString();
-  return i.slice(0,10)+' '+i.slice(11,16)+' UTC+8';
+function toLocalTz(m){
+  const t=new Date(m+':00Z'),c=new Date(t.getTime()+TZ_OFFSET_MS),i=c.toISOString();
+  return i.slice(0,10)+' '+i.slice(11,16)+' '+TZ_LABEL;
 }
 async function loadChart(){
   const z=document.getElementById('zi').value.trim();
@@ -759,17 +828,13 @@ async function loadChart(){
     :24;
   const intervalMin=spanHours<=1?10:spanHours<=6?30:spanHours<=24?120:spanHours<=72?360:720;
   // 生成标签：首尾强制显示，中间按intervalMin整点显示，其余留空
-  function fmtUTC8(minute_utc){
-    const t=new Date(minute_utc+':00Z');
-    const c=new Date(t.getTime()+8*3600000),i=c.toISOString();
-    return i.slice(0,10)+' '+i.slice(11,16)+' UTC+8';
-  }
+  // 复用外部 toLocalTz() 函数（使用服务端注入的时区配置）
   const labels=d.map((x,idx)=>{
-    if(idx===0||idx===d.length-1)return fmtUTC8(x.minute_utc); // 首尾必显示
+    if(idx===0||idx===d.length-1)return toLocalTz(x.minute_utc); // 首尾必显示
     const t=new Date(x.minute_utc+':00Z');
-    const c=new Date(t.getTime()+8*3600000);
+    const c=new Date(t.getTime()+TZ_OFFSET_MS);
     const totalMin=c.getUTCHours()*60+c.getUTCMinutes();
-    return totalMin%intervalMin===0?fmtUTC8(x.minute_utc):'';
+    return totalMin%intervalMin===0?toLocalTz(x.minute_utc):'';
   });
   const vals=d.map(x=>x.mbps);
   const nz=vals.filter(v=>v>0);
@@ -803,10 +868,10 @@ async function loadChart(){
         legend:{labels:{color:'#bbb',font:{size:12}}},
         tooltip:{callbacks:{
           title:function(items){
-            // tooltip 标题显示当前数据点的 UTC+8 时间
+            // tooltip 标题显示当前数据点的本地时区时间
             const idx=items[0]?.dataIndex;
             if(idx==null||!d[idx])return '';
-            return fmtUTC8(d[idx].minute_utc);
+            return toLocalTz(d[idx].minute_utc);
           },
           label:c=>[
             'Bandwidth: '+c.parsed.y+' Mbps',
@@ -820,21 +885,31 @@ async function loadChart(){
 async function loadStatus(){
   try{
     const r=await fetch('/api/status',{headers:HDRS});const j=await r.json();
-    const cst=s=>s?new Date(new Date(s+':00Z').getTime()+8*3600000).toISOString().slice(0,16).replace('T',' ')+' UTC+8':'N/A';
+    const cst=s=>s?new Date(new Date(s+':00Z').getTime()+TZ_OFFSET_MS).toISOString().slice(0,16).replace('T',' ')+' '+TZ_LABEL:'N/A';
     document.getElementById('st').textContent=
       'done='+j.files.done+' proc='+j.files.processing+' fail='+j.files.failed+
       ' | alerts='+j.alert_count+
       ' | data: '+cst(j.data_range?.min_t)+' ~ '+cst(j.data_range?.max_t);
   }catch(e){document.getElementById('st').textContent='❌ '+e.message;}
 }
-// 自动刷新：每60秒重新加载图表数据
+// 自动刷新：每60秒重新加载图表数据（修复 #16：页面不可见时暂停刷新）
 let autoRefreshTimer = null;
 function startAutoRefresh() {
   if (autoRefreshTimer) clearInterval(autoRefreshTimer);
   autoRefreshTimer = setInterval(() => {
-    loadChart();
+    // 页面可见时才刷新（Tab 切走/最小化时不浪费 API 调用）
+    if (document.visibilityState === 'visible') {
+      loadChart();
+    }
   }, 60000);
 }
+
+// 页面从不可见切换回可见时，立即刷新一次（保证用户看到最新数据）
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') {
+    loadChart();
+  }
+});
 
 // 页面加载时自动加载图表并启动自动刷新
 loadChart().then(() => startAutoRefresh());
@@ -849,7 +924,7 @@ loadChart().then(() => startAutoRefresh());
   // - connect-src: API 请求限制在本站
   const csp = [
     "default-src 'self'",
-    "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net",
+    "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://unpkg.com https://cdnjs.cloudflare.com",
     "style-src 'self' 'unsafe-inline'",
     "img-src 'self' data:",
     "connect-src 'self'",

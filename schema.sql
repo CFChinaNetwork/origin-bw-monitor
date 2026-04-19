@@ -40,3 +40,10 @@ CREATE TABLE IF NOT EXISTS alert_history (
 );
 
 CREATE INDEX IF NOT EXISTS idx_alert_zone_type ON alert_history(zone, alert_type, alerted_at);
+
+-- #19 优化：cleanup 按 alerted_at 范围删除，以及 Dashboard 可能按时间查 alert 历史
+-- 额外一个 alerted_at 单列索引，加速这些查询
+CREATE INDEX IF NOT EXISTS idx_alert_time ON alert_history(alerted_at);
+
+-- 同样为 processed_files 添加 finished_at 索引，cleanup 需要按此列删除
+CREATE INDEX IF NOT EXISTS idx_file_finished ON processed_files(finished_at);

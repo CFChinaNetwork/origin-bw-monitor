@@ -66,6 +66,10 @@ MAX_PROCESSING_MIN = "15"
 # D1 数据保留天数，每日 UTC 02:00 自动清理
 DATA_RETENTION_DAYS = "7"
 
+# Dashboard 和告警显示的时区偏移（小时）
+# 默认 8（UTC+8，中国大陆）；可改为 0（UTC）、-8（美西）、9（日韩）等
+DISPLAY_TZ_OFFSET_HOURS = "8"
+
 # Dashboard 访问鉴权（留空 = 不鉴权，仅开发调试用）
 # 生产环境强烈建议：wrangler secret put DASHBOARD_TOKEN
 DASHBOARD_TOKEN = ""
