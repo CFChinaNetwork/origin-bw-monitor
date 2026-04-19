@@ -688,11 +688,17 @@ async function loadChart(){
     j=await r.json();
   }catch(e){document.getElementById('st').textContent='❌ '+e.message;return;}
   const d=j.data||[];
-  const labels=d.map((x,index)=>{
-    const t=new Date(x.minute_utc+':00Z'),c=new Date(t.getTime()+8*3600000),i=c.toISOString();
-    const date=i.slice(0,10),time=i.slice(11,16);
-    // 首尾显示完整日期+时间，中间只显示时间
-    return(index===0||index===d.length-1)?date+' '+time+' UTC+8':time+' UTC+8';
+  // 根据时间范围自动选择标注间隔（只在整N分钟倍数处显示标签，其余留空）
+  // 这样横轴整洁，与网格线对齐，彻底避免 undefined
+  const totalHours=parseInt(document.getElementById('hs').value||'24',10);
+  const intervalMin=totalHours<=1?10:totalHours<=6?30:totalHours<=24?120:totalHours<=72?360:720;
+  const labels=d.map((x)=>{
+    const t=new Date(x.minute_utc+':00Z');
+    const c=new Date(t.getTime()+8*3600000);
+    const i=c.toISOString();
+    const totalMin=c.getUTCHours()*60+c.getUTCMinutes();
+    if(totalMin%intervalMin!==0)return '';
+    return i.slice(0,10)+' '+i.slice(11,16)+' UTC+8';
   });
   const vals=d.map(x=>x.mbps);
   const nz=vals.filter(v=>v>0);
@@ -715,17 +721,12 @@ async function loadChart(){
     options:{
       responsive:true,interaction:{mode:'index',intersect:false},
       scales:{
-        x:{ticks:{color:'#777',maxTicksLimit:12,maxRotation:0,
-          callback:function(value,index,ticks){
-            // ticks[index].label 比 getLabelForValue 更可靠
-            // 格式：'2026-04-18 09:26 UTC+8'
-            const label=(ticks[index]&&ticks[index].label)||'';
-            if(!label)return '';
-            if(index===0||index===ticks.length-1)return label;
-            // 中间点只显示时间部分：'09:26 UTC+8'
-            const sp=label.split(' ');
-            return(sp[1]||'')+' '+(sp[2]||'');
-          }},grid:{color:'#1a1a1a'}},
+        x:{ticks:{color:'#777',maxRotation:0,autoSkip:false,
+          // 标签已在数据处理时按间隔生成，空字符串表示不显示，直接透传
+         callback:function(value){
+           const label=this.getLabelForValue(value);
+           return label||null;
+         },grid:{color:'#1a1a1a'}},
         y:{ticks:{color:'#777',callback:v=>v+' Mbps'},grid:{color:'#1a1a1a'},beginAtZero:true}
       },
       plugins:{
