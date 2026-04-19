@@ -2,6 +2,7 @@ name = "origin-bw-monitor"
 main = "src/index.js"
 compatibility_date = "2026-04-01"
 compatibility_flags = ["nodejs_compat"]
+account_id = "0297df3199a94c8082d099ac2212c40a"   # Steve-Tenant-Account-CDN
 
 # ── Observability ─────────────────────────────────────────────
 [observability]
