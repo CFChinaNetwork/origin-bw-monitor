@@ -156,6 +156,10 @@
 <span class="comment">│  ④ Bucket by EdgeEndTimestamp (request end time) → per-minute aggregation   │</span>
 <span class="comment">│       key = "2026-04-14T03:01|example.com"                                  │</span>
 <span class="comment">│       value = { sum: total_bytes_for_this_minute }                          │</span>
+<span class="comment">│                                                                             │</span>
+<span class="comment">│  ⑤ Does the file contain log lines within the Safe Lag Window?              │</span>
+<span class="comment">│       Yes → reset to pending; Cron retries every 8 min after lag expires    │</span>
+<span class="comment">│       No  → proceed to write D1                                             │</span>
 <span class="comment">└───────────────────────────────────────┬─────────────────────────────────────┘</span>
                                         │
                 <span class="step">[Step 3]</span> Batch upsert into D1 (accumulative, idempotent)
@@ -174,15 +178,27 @@
 <span class="comment">│  Retention: 7 days, auto-cleaned daily at UTC 02:00                         │</span>
 <span class="comment">└───────────────────────────────────────┬─────────────────────────────────────┘</span>
                                         │
-                <span class="step">[Step 4]</span> Dashboard Worker serves HTTP chart
+                <span class="step">[Step 4]</span> Alert check (query D1 for minutes just written)
+                                        │
+                                        ▼
+<span class="comment">┌─────────────────────────────────────────────────────────────────────────────┐</span>
+<span class="comment">│  Automatic Alerts (if Webhook configured)                                   │</span>
+<span class="comment">│                                                                             │</span>
+<span class="comment">│  · Threshold alert: current-minute Mbps > ALERT_THRESHOLD_MBPS             │</span>
+<span class="comment">│  · Spike alert:    current Mbps > 24h peak × ALERT_SPIKE_MULTIPLIER        │</span>
+<span class="comment">│  · Cooldown: same zone + same alert type fires at most once per 30 min     │</span>
+<span class="comment">│  · Supports WeCom / DingTalk / Feishu in any combination                   │</span>
+<span class="comment">└───────────────────────────────────────┬─────────────────────────────────────┘</span>
+                                        │
+                <span class="step">[Step 5]</span> Dashboard Worker serves HTTP chart
                                         │
                                         ▼
 <span class="comment">┌─────────────────────────────────────────────────────────────────────────────┐</span>
 <span class="comment">│  Dashboard                                                                  │</span>
 <span class="comment">│                                                                             │</span>
 <span class="comment">│  Browser → GET / → Worker queries D1 → Chart.js renders bandwidth curve    │</span>
-<span class="comment">│  URL: https://origin-bw-monitor.&lt;subdomain&gt;.workers.dev/                   │</span>
-<span class="comment">│       ?zone=example.com&amp;hours=24                                            │</span>
+<span class="comment">│  Auto-refreshes every 60 seconds, no manual action needed                  │</span>
+<span class="comment">│  URL: https://origin-bw-monitor.&lt;subdomain&gt;.workers.dev/?zone=example.com  │</span>
 <span class="comment">└─────────────────────────────────────────────────────────────────────────────┘</span>
 </div>
 
@@ -251,7 +267,7 @@ database_id   = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"   # ← paste here</code>
 <p>Verify:</p>
 <pre><code>wrangler d1 execute bw-stats \
   --command="SELECT name FROM sqlite_master WHERE type='table'" --remote</code></pre>
-<p>Expected output: <code>bw_stats</code> and <code>processed_files</code>.</p>
+<p>Expected output: <code>bw_stats</code>, <code>processed_files</code>, and <code>alert_history</code>.</p>
 
 <h3>Step 3 — Create Queues</h3>
 <pre><code>wrangler queues create bw-ingest-queue
@@ -269,15 +285,15 @@ database_id = "xxxxxxxx-..."          # ← from Step 1
 [vars]
 LOG_PREFIX = "logs/"                  # ← Logpush path prefix (usually "logs/")</code></pre>
 
-<h3>Step 5 — Configure R2 Event Notification</h3>
-<p>This is the primary trigger that enables near-real-time processing.</p>
+<h3>Step 5 — Configure R2 Event Notification (Required)</h3>
+<p>This is the primary trigger for the entire processing pipeline. <strong>Must be configured</strong> — without it, new files written to R2 will not be processed automatically.</p>
 <ol>
   <li>CF Dashboard → R2 → your Logpush bucket → <strong>Settings</strong> → <strong>Event Notifications</strong></li>
   <li>Click <strong>Add notification</strong></li>
   <li>Set: Event type = <code>object-create</code>, Queue = <code>bw-ingest-queue</code></li>
-  <li>Optional: Prefix = <code>logs/</code>, Suffix = <code>.gz</code></li>
+  <li>Optional: Prefix = <code>logs/</code>, Suffix = <code>.gz</code> (limits triggers to Logpush files only)</li>
+  <li>Once saved, every time Logpush writes a new file to R2, the Queue receives a message automatically</li>
 </ol>
-<div class="note"><strong>Important:</strong> Without R2 Event Notification, the Worker only runs on the 8-minute Cron schedule. Event Notification is strongly recommended for timely processing.</div>
 
 <h3>Step 6 — Configure Alerts (Optional — skip entirely if not needed)</h3>
 <p>Alerting is fully optional. If you don't need alerts, <strong>skip this step</strong> — the tool runs normally and simply won't send any notifications.</p>
@@ -316,17 +332,28 @@ curl "https://origin-bw-monitor.&lt;subdomain&gt;.workers.dev/api/status"
   <tbody>
     <tr><td><code>LOG_PREFIX</code></td><td><code>logs/</code></td><td><span class="badge badge-req">Required</span></td><td>Path prefix inside R2 for Logpush files. Must match your Logpush job configuration.</td></tr>
     <tr><td><code>LAG_MINUTES</code></td><td><code>7</code></td><td><span class="badge badge-opt">Optional</span></td><td>Safe Lag Window in minutes. Files newer than <code>now - LAG_MINUTES</code> are skipped to ensure all Logpush files for a given minute have landed in R2. Do not set below 5.</td></tr>
-    <tr><td><code>SCAN_BATCH_SIZE</code></td><td><code>20</code></td><td><span class="badge badge-opt">Optional</span></td><td>Max files to enqueue per Cron run. Controls max files retried per Cron run.</td></tr>
-    <tr><td><code>MAX_PROCESSING_MIN</code></td><td><code>15</code></td><td><span class="badge badge-opt">Optional</span></td><td>If a file stays in <code>processing</code> status for longer than this (minutes), it is assumed the Worker crashed and the file is re-queued.</td></tr>
+    <tr><td><code>MAX_PROCESSING_MIN</code></td><td><code>15</code></td><td><span class="badge badge-opt">Optional</span></td><td>Processing timeout threshold (minutes). A file stuck in <code>processing</code> longer than this is assumed crashed and re-queued.</td></tr>
     <tr><td><code>DATA_RETENTION_DAYS</code></td><td><code>7</code></td><td><span class="badge badge-opt">Optional</span></td><td>D1 data retention in days. Older data is deleted daily at UTC 02:00 by the cleanup Cron.</td></tr>
     <tr><td><code>LOG_LEVEL</code></td><td><code>info</code></td><td><span class="badge badge-opt">Optional</span></td><td>Worker log verbosity: <code>debug</code> / <code>info</code> / <code>warn</code> / <code>error</code>. Use <code>debug</code> for troubleshooting; revert to <code>info</code> in production.</td></tr>
-    <tr><td><code>DASHBOARD_TOKEN</code></td><td><em>empty</em></td><td><span class="badge badge-opt">Optional</span></td><td>Access token for the Dashboard UI. Empty = no authentication (development only). Production: set via <code>wrangler secret put DASHBOARD_TOKEN</code>.</td></tr>
+    <tr><td><code>ALERT_THRESHOLD_MBPS</code></td><td><em>empty (disabled)</em></td><td><span class="badge badge-opt">Optional</span></td><td>Fixed threshold alert (Mbps). Fires when the current-minute bandwidth exceeds this value. Example: <code>"500"</code>.</td></tr>
+    <tr><td><code>ALERT_SPIKE_MULTIPLIER</code></td><td><em>empty (disabled)</em></td><td><span class="badge badge-opt">Optional</span></td><td>Spike multiplier alert. Fires when current bandwidth exceeds the 24h peak by this factor. Example: <code>"5"</code>.</td></tr>
+    <tr><td><code>ALERT_COOLDOWN_MIN</code></td><td><code>30</code></td><td><span class="badge badge-opt">Optional</span></td><td>Cooldown period (minutes) per zone per alert type, to prevent alert storms.</td></tr>
+    <tr><td><code>ALERT_DASHBOARD_URL</code></td><td><em>empty</em></td><td><span class="badge badge-opt">Optional</span></td><td>Dashboard URL embedded in alert messages. When set, a "View Dashboard" button appears in the alert card.</td></tr>
+    <tr><td><code>DASHBOARD_TOKEN</code></td><td><em>empty (no auth)</em></td><td><span class="badge badge-opt">Optional</span></td><td>Dashboard access token. Empty = no authentication (development only). Production: set via <code>wrangler secret put DASHBOARD_TOKEN</code>.</td></tr>
   </tbody>
 </table>
 
 <h3>GitHub Actions CI/CD</h3>
-<p>The repo includes <code>.github/workflows/deploy.yml</code>. Any push to <code>main</code> triggers automatic deployment.</p>
-<p>Required GitHub secret: <code>CLOUDFLARE_API_TOKEN</code> (Workers Deploy permission).</p>
+<p>The repo includes <code>.github/workflows/deploy.yml</code>. Any push to <code>main</code> triggers automatic deployment. Configure the following 4 Secrets in GitHub repository Settings → Secrets → Actions:</p>
+<table>
+  <thead><tr><th>Secret Name</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td><code>CLOUDFLARE_API_TOKEN</code></td><td>CF API Token with Workers Deploy permission</td></tr>
+    <tr><td><code>CLOUDFLARE_ACCOUNT_ID</code></td><td>Your Cloudflare Account ID</td></tr>
+    <tr><td><code>R2_BUCKET_NAME</code></td><td>Logpush R2 bucket name</td></tr>
+    <tr><td><code>D1_DATABASE_ID</code></td><td>D1 database ID (from <code>wrangler d1 create</code> output)</td></tr>
+  </tbody>
+</table>
 
 <!-- ── 6. Operations ── -->
 <h2 id="ops"><span class="num">6</span> Operations</h2>
@@ -339,6 +366,7 @@ curl "https://origin-bw-monitor.&lt;subdomain&gt;.workers.dev/api/status"
     <tr><td>Queue backlog</td><td>Near 0</td><td>Check Worker logs; look for errors</td></tr>
     <tr><td>DLQ (<code>bw-ingest-dlq</code>)</td><td>0 messages</td><td>Messages present → check <code>/api/status</code> for failed files, then <code>/api/retry</code></td></tr>
     <tr><td><code>/api/status</code> <code>failed</code></td><td>0</td><td>Call <code>POST /api/retry</code> to re-queue</td></tr>
+    <tr><td><code>/api/status</code> <code>alert_count</code></td><td>Matches actual alert events</td><td>If 0 and alerts expected, check threshold config and Webhook secrets</td></tr>
   </tbody>
 </table>
 
@@ -357,20 +385,22 @@ curl "https://origin-bw-monitor.&lt;subdomain&gt;.workers.dev/api/status"
 <pre><code>wrangler tail origin-bw-monitor</code></pre>
 <p>Expected log output:</p>
 <pre><code>[INFO] Processing: logs/20260414/20260414T100000Z_abc.log.gz
-[INFO] Done: logs/20260414/... | lines=87234 lag=0 filter=83891 err=0 minutes=11</code></pre>
+[INFO] Done: logs/20260414/... | lines=87234 lag=0 filter=83891 err=0 minutes=11
+[WARN] Alert [threshold] zone=example.com mbps=623.5 threshold=500</code></pre>
 
 <h3>Reset</h3>
 <pre><code># Clear all data and start fresh
 wrangler d1 execute bw-stats \
-  --command="DELETE FROM bw_stats; DELETE FROM processed_files;" \
+  --command="DELETE FROM bw_stats; DELETE FROM processed_files; DELETE FROM alert_history;" \
   --remote
 
 # New files will be processed automatically via R2 Event Notifications</code></pre>
 
 </div>
 
-<!-- ── Dashboard Screenshot ── -->
-<h2 id="screenshot"><span class="num">7</span> Dashboard Example</h2>
+<!-- ── 7. Dashboard Example ── -->
+<h2 id="screenshot" style="margin:0 0 0 0"><span class="num" style="margin-left:48px">7</span> Dashboard Example</h2>
+<div class="main" style="padding-top:16px">
 
 <p>After successful deployment, once Logpush files start arriving, the Dashboard will display a per-minute origin pull bandwidth chart similar to the following:</p>
 
@@ -380,42 +410,40 @@ wrangler d1 execute bw-stats \
 </div>
 
 <p style="font-size:12px;color:var(--muted);margin-top:8px;">
-  <em>Screenshot: Peak bandwidth cards, per-minute bandwidth curve chart, zone selector, time range selector, and system status display. Zone name has been masked for privacy.</em>
+  <em>Screenshot: Peak/average/total bandwidth cards, per-minute bandwidth curve chart, zone input, time range selector (1h/6h/24h/3d/7d), and system status. Chart auto-refreshes every 60 seconds. Zone name has been masked for privacy.</em>
 </p>
 
-
-<!-- ── Alert Examples ── -->
+<!-- ── 8. Alert Examples ── -->
 <h2 id="alerts"><span class="num">8</span> Alert Examples</h2>
 
-
-<p>When bandwidth exceeds the configured threshold or spikes above the multiplier, alerts are automatically sent to the configured webhook channels. Below is an example of how DingTalk (钉钉) alerts appear:</p>
+<p>When bandwidth exceeds the configured threshold or spikes above the multiplier, alerts are automatically sent to the configured webhook channels. Below is an example of how DingTalk (钉钉) alerts appear (WeCom and Feishu use similar card formats):</p>
 
 <div style="background:#1a1a2e;border-radius:8px;padding:20px;margin:16px 0;font-family:'PingFang SC',sans-serif;max-width:380px">
   <div style="background:#fff;border-radius:12px;padding:16px;box-shadow:0 2px 8px rgba(0,0,0,0.15)">
-    <div style="font-size:13px;color:#333;font-weight:600;margin-bottom:12px">🚨 CF 回源带宽超阈值告警</div>
+    <div style="font-size:13px;color:#333;font-weight:600;margin-bottom:12px">🚨 CF Origin Bandwidth Threshold Alert</div>
     <div style="font-size:12px;color:#666;line-height:2">
-      <b>域名：</b> example.com<br>
-      <b>时间：</b> 2026-04-19 11:21 UTC+8<br>
-      <b>当前带宽：</b> <span style="color:#e74c3c;font-weight:600">8.001 Mbps</span><br>
-      <b>设定阈值：</b> 500 Mbps
+      <b>Zone:</b> example.com<br>
+      <b>Time:</b> 2026-04-19 11:21 UTC+8<br>
+      <b>Current:</b> <span style="color:#e74c3c;font-weight:600">800 Mbps</span><br>
+      <b>Threshold:</b> 500 Mbps
     </div>
-    <div style="margin-top:12px;padding:8px 12px;background:#f6821f;color:#fff;text-align:center;border-radius:6px;font-size:12px;font-weight:600">查看监控面板</div>
+    <div style="margin-top:12px;padding:8px 12px;background:#f6821f;color:#fff;text-align:center;border-radius:6px;font-size:12px;font-weight:600">View Dashboard</div>
   </div>
   <div style="background:#fff;border-radius:12px;padding:16px;box-shadow:0 2px 8px rgba(0,0,0,0.15);margin-top:10px">
-    <div style="font-size:13px;color:#333;font-weight:600;margin-bottom:12px">⚡ CF 回源带宽突增告警</div>
+    <div style="font-size:13px;color:#333;font-weight:600;margin-bottom:12px">⚡ CF Origin Bandwidth Spike Alert</div>
     <div style="font-size:12px;color:#666;line-height:2">
-      <b>域名：</b> example.com<br>
-      <b>时间：</b> 2026-04-19 11:21 UTC+8<br>
-      <b>当前带宽：</b> <span style="color:#e74c3c;font-weight:600">8.001 Mbps</span><br>
-      <b>24h历史峰值：</b> 2.667 Mbps<br>
-      <b>当前倍数：</b> <span style="color:#e74c3c;font-weight:600">3.0 倍</span>
+      <b>Zone:</b> example.com<br>
+      <b>Time:</b> 2026-04-19 11:21 UTC+8<br>
+      <b>Current:</b> <span style="color:#e74c3c;font-weight:600">800 Mbps</span><br>
+      <b>24h Peak:</b> 120 Mbps<br>
+      <b>Multiplier:</b> <span style="color:#e74c3c;font-weight:600">6.7×</span>
     </div>
-    <div style="margin-top:12px;padding:8px 12px;background:#f6821f;color:#fff;text-align:center;border-radius:6px;font-size:12px;font-weight:600">查看监控面板</div>
+    <div style="margin-top:12px;padding:8px 12px;background:#f6821f;color:#fff;text-align:center;border-radius:6px;font-size:12px;font-weight:600">View Dashboard</div>
   </div>
 </div>
 
 <p style="font-size:12px;color:var(--muted);margin-top:8px">
-  <em>Alert cards shown above simulate the DingTalk (钉钉) message format. WeCom and Feishu use similar card-style messages. Domain name shown is a placeholder.</em>
+  <em>Alert cards above simulate the DingTalk message format. WeCom and Feishu use similar card-style messages. Domain name and values shown are placeholders.</em>
 </p>
 
 <div class="footer">
@@ -423,5 +451,6 @@ wrangler d1 execute bw-stats \
   <a href="https://github.com/CFChinaNetwork/origin-bw-monitor" target="_blank">github.com/CFChinaNetwork/origin-bw-monitor</a>
 </div>
 
+</div>
 </body>
 </html>
