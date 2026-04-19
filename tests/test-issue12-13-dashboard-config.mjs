@@ -2,9 +2,10 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { readAllSrc } from './_read-all-src.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const src = fs.readFileSync(path.resolve(__dirname, '../src/index.js'), 'utf-8');
+const src = readAllSrc();
 
 let pass = 0, fail = 0;
 

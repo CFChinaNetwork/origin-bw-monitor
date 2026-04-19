@@ -1,11 +1,6 @@
 // 问题 #5 测试：buildDashboardUrl 能正确处理各种 dashUrl 格式
-import fs from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const srcPath = path.resolve(__dirname, '../src/index.js');
-const source = fs.readFileSync(srcPath, 'utf-8');
+import { readAllSrc } from './_read-all-src.mjs';
+const source = readAllSrc();
 
 const match = source.match(/function buildDashboardUrl\(dashUrl, zone\) \{[\s\S]+?\n\}/);
 if (!match) {

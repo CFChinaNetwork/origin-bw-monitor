@@ -2,13 +2,8 @@
 // 直接调用源码中的 escapeHtml 和 handleDashboard，用经典 XSS payload 尝试注入
 // 用法: node tests/test-bug3-xss.mjs
 
-import fs from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const srcPath = path.resolve(__dirname, '../src/index.js');
-const source = fs.readFileSync(srcPath, 'utf-8');
+import { readAllSrc } from './_read-all-src.mjs';
+const source = readAllSrc();
 
 // ========== 1. 提取并测试 escapeHtml 函数 ==========
 // 用 Function() 动态 eval 提取的函数（只是工具函数，不执行业务逻辑）

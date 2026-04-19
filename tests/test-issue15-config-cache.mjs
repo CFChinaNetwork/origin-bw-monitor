@@ -1,10 +1,6 @@
 // 问题 #15 测试：getConfig 应该缓存结果
-import fs from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const src = fs.readFileSync(path.resolve(__dirname, '../src/index.js'), 'utf-8');
+import { readAllSrc } from './_read-all-src.mjs';
+const src = readAllSrc();
 
 let pass = 0, fail = 0;
 
