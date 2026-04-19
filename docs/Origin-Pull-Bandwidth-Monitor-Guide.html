@@ -277,18 +277,30 @@ LOG_PREFIX = "logs/"                  # ← Logpush path prefix (usually "logs/"
   <li>Set: Event type = <code>object-create</code>, Queue = <code>bw-ingest-queue</code></li>
   <li>Optional: Prefix = <code>logs/</code>, Suffix = <code>.gz</code></li>
 </ol>
-<div class="note"><strong>Important:</strong> Without R2 Event Notification, the Worker only runs on the 10-minute Cron schedule. Event Notification is strongly recommended for timely processing.</div>
+<div class="note"><strong>Important:</strong> Without R2 Event Notification, the Worker only runs on the 8-minute Cron schedule. Event Notification is strongly recommended for timely processing.</div>
 
-<h3>Step 6 — Set Dashboard Token (Optional)</h3>
+<h3>Step 6 — Configure Alerts (Optional — skip entirely if not needed)</h3>
+<p>Alerting is fully optional. If you don't need alerts, <strong>skip this step</strong> — the tool runs normally and simply won't send any notifications.</p>
+<p>To enable alerts, set thresholds in <code>wrangler.toml</code> and configure at least one webhook:</p>
+<pre><code># wrangler.toml — leave either blank to disable that alert type
+ALERT_THRESHOLD_MBPS   = "500"   # alert when bandwidth exceeds 500 Mbps (blank = disabled)
+ALERT_SPIKE_MULTIPLIER = "5"     # alert when bandwidth exceeds 5× 24h peak (blank = disabled)
+ALERT_DASHBOARD_URL    = "https://origin-bw-monitor.your-subdomain.workers.dev"</code></pre>
+<pre><code># Any combination of the three channels is supported; unused channels can be left unset
+wrangler secret put ALERT_WEBHOOK_DINGTALK   # DingTalk (optional)
+wrangler secret put ALERT_WEBHOOK_WECOM      # WeCom / WeChat Work (optional)
+wrangler secret put ALERT_WEBHOOK_FEISHU     # Feishu / Lark (optional)</code></pre>
+
+<h3>Step 7 — Set Dashboard Token (Optional)</h3>
 <pre><code># Leave empty to disable authentication (development only)
 # For production, set a strong random string:
 wrangler secret put DASHBOARD_TOKEN</code></pre>
 
-<h3>Step 7 — Deploy</h3>
+<h3>Step 8 — Deploy</h3>
 <pre><code>wrangler deploy</code></pre>
 <p>Expected output confirms: D1 binding, R2 binding, Queue producer/consumer, two Cron schedules.</p>
 
-<h3>Step 8 — Verify</h3>
+<h3>Step 9 — Verify</h3>
 <pre><code># Check system status
 curl "https://origin-bw-monitor.&lt;subdomain&gt;.workers.dev/api/status"
 
