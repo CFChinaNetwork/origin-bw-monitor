@@ -688,17 +688,31 @@ async function loadChart(){
     j=await r.json();
   }catch(e){document.getElementById('st').textContent='❌ '+e.message;return;}
   const d=j.data||[];
-  // 根据时间范围自动选择标注间隔（只在整N分钟倍数处显示标签，其余留空）
-  // 这样横轴整洁，与网格线对齐，彻底避免 undefined
-  const totalHours=parseInt(document.getElementById('hs').value||'24',10);
-  const intervalMin=totalHours<=1?10:totalHours<=6?30:totalHours<=24?120:totalHours<=72?360:720;
-  const labels=d.map((x)=>{
+  // 根据实际数据跨度计算标注间隔
+  // 用 API 返回的 since/end 计算，不依赖 DOM
+  const spanHours=j.since&&j.end
+    ?(new Date(j.end+':00Z')-new Date(j.since+':00Z'))/3600000
+    :24;
+  const intervalMin=spanHours<=1?10:spanHours<=6?30:spanHours<=24?120:spanHours<=72?360:720;
+  // 先生成原始标签
+  const rawLabels=d.map((x)=>{
     const t=new Date(x.minute_utc+':00Z');
     const c=new Date(t.getTime()+8*3600000);
     const i=c.toISOString();
     const totalMin=c.getUTCHours()*60+c.getUTCMinutes();
     if(totalMin%intervalMin!==0)return '';
     return i.slice(0,10)+' '+i.slice(11,16)+' UTC+8';
+  });
+  // 保底：若没有任何标签命中，强制首尾和中间各一个
+  const hasAny=rawLabels.some(l=>l!=='');
+  const labels=rawLabels.map((l,idx)=>{
+    if(l!=='')return l;
+    if(!hasAny&&(idx===0||idx===Math.floor(d.length/2)||idx===d.length-1)){
+      const t=new Date(d[idx].minute_utc+':00Z');
+      const c=new Date(t.getTime()+8*3600000),i=c.toISOString();
+      return i.slice(0,10)+' '+i.slice(11,16)+' UTC+8';
+    }
+    return '';
   });
   const vals=d.map(x=>x.mbps);
   const nz=vals.filter(v=>v>0);
