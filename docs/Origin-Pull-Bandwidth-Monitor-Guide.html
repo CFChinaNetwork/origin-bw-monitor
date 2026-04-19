@@ -85,7 +85,7 @@
     <tr><td><strong>Deployment</strong></td><td>Deployed in <strong>your own Cloudflare account</strong> — no cross-account access, no external servers</td></tr>
     <tr><td><strong>R2 Access</strong></td><td>Read-only via R2 Binding — <strong>never writes to your R2</strong></td></tr>
     <tr><td><strong>Data Retention</strong></td><td>7 days (configurable), auto-cleaned daily</td></tr>
-    <tr><td><strong>Chart Lag</strong></td><td>~10 minutes (Safe Lag Window 7 min + processing ~2 min)</td></tr>
+    <tr><td><strong>Chart Lag</strong></td><td>~10–15 minutes (Lag Window 7 min + Cron retry ≤8 min + processing ~1 min)</td></tr>
   </tbody>
 </table>
 
@@ -193,7 +193,7 @@
     <tr><td>Worker → D1</td><td>Within the same Worker invocation</td><td>Milliseconds</td></tr>
     <tr><td>Total end-to-end</td><td>Logpush (~60s) + Event Notification (~5s) + Queue (~15s) + Processing (~30s)</td><td><strong>~2 minutes</strong></td></tr>
     <tr><td>Safe Lag Window</td><td>Additional buffer to ensure all files for a given minute have landed</td><td><strong>+7 minutes</strong></td></tr>
-    <tr><td><strong>Chart data lag</strong></td><td>Total from request to visible on chart</td><td><strong>~10 minutes</strong></td></tr>
+    <tr><td><strong>Chart data lag</strong></td><td>Total from request to visible on chart</td><td><strong>~10–15 minutes</strong></td></tr>
   </tbody>
 </table>
 
@@ -398,6 +398,40 @@ wrangler d1 execute bw-stats \
 
 <p style="font-size:12px;color:var(--muted);margin-top:8px;">
   <em>Screenshot: Peak bandwidth cards, per-minute bandwidth curve chart, zone selector, time range selector, and system status display. Zone name has been masked for privacy.</em>
+</p>
+
+
+<!-- ── Alert Examples ── -->
+<h2 id="alerts"><span class="num">8</span> Alert Examples</h2>
+
+<p>When bandwidth exceeds the configured threshold or spikes above the multiplier, alerts are automatically sent to the configured webhook channels. Below is an example of how DingTalk (钉钉) alerts appear:</p>
+
+<div style="background:#1a1a2e;border-radius:8px;padding:20px;margin:16px 0;font-family:'PingFang SC',sans-serif;max-width:380px">
+  <div style="background:#fff;border-radius:12px;padding:16px;box-shadow:0 2px 8px rgba(0,0,0,0.15)">
+    <div style="font-size:13px;color:#333;font-weight:600;margin-bottom:12px">🚨 CF 回源带宽超阈值告警</div>
+    <div style="font-size:12px;color:#666;line-height:2">
+      <b>域名：</b> example.com<br>
+      <b>时间：</b> 2026-04-19 11:21 UTC+8<br>
+      <b>当前带宽：</b> <span style="color:#e74c3c;font-weight:600">8.001 Mbps</span><br>
+      <b>设定阈值：</b> 500 Mbps
+    </div>
+    <div style="margin-top:12px;padding:8px 12px;background:#f6821f;color:#fff;text-align:center;border-radius:6px;font-size:12px;font-weight:600">查看监控面板</div>
+  </div>
+  <div style="background:#fff;border-radius:12px;padding:16px;box-shadow:0 2px 8px rgba(0,0,0,0.15);margin-top:10px">
+    <div style="font-size:13px;color:#333;font-weight:600;margin-bottom:12px">⚡ CF 回源带宽突增告警</div>
+    <div style="font-size:12px;color:#666;line-height:2">
+      <b>域名：</b> example.com<br>
+      <b>时间：</b> 2026-04-19 11:21 UTC+8<br>
+      <b>当前带宽：</b> <span style="color:#e74c3c;font-weight:600">8.001 Mbps</span><br>
+      <b>24h历史峰值：</b> 2.667 Mbps<br>
+      <b>当前倍数：</b> <span style="color:#e74c3c;font-weight:600">3.0 倍</span>
+    </div>
+    <div style="margin-top:12px;padding:8px 12px;background:#f6821f;color:#fff;text-align:center;border-radius:6px;font-size:12px;font-weight:600">查看监控面板</div>
+  </div>
+</div>
+
+<p style="font-size:12px;color:var(--muted);margin-top:8px">
+  <em>Alert cards shown above simulate the DingTalk (钉钉) message format. WeCom and Feishu use similar card-style messages. Domain name shown is a placeholder.</em>
 </p>
 
 <div class="footer">

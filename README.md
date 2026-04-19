@@ -20,7 +20,7 @@ Dashboard chart (query D1 → Chart.js)
 - **Event-driven only** — processes new files via R2 Event Notification; no historical backfill
 - **Read-only on R2** — never writes, modifies, or deletes R2 objects
 - **Safe Lag Window** — waits 7 min before processing, ensuring all Logpush files for a given minute have landed
-- **Pending retry** — files too new for the lag window are retried every 20 min via Cron
+- **Pending retry** — files too new for the lag window are retried every 8 min via Cron
 
 ## Formula
 

@@ -204,7 +204,7 @@
 
 <p><strong>幂等累加写入：</strong>D1 写入使用 <code>INSERT ... ON CONFLICT DO UPDATE SET sum_bytes = sum_bytes + excluded.sum_bytes</code>。同一分钟内来自多个文件的数据会被正确累加。如果文件被重试，<code>processed_files</code> 状态检查会防止重复计算。</p>
 
-<p><strong>R2 Event Notification 为主要触发器：</strong>无需每 N 分钟轮询 R2，R2 Event Notification 实现近实时处理。辅助 Cron（每20分钟）重试因 lag 窗口被推迟处理的 pending 文件，确保数据完整。</p>
+<p><strong>R2 Event Notification 为主要触发器：</strong>无需每 N 分钟轮询 R2，R2 Event Notification 实现近实时处理。辅助 Cron（每8分钟）重试因 lag 窗口被推迟处理的 pending 文件，确保数据完整。</p>
 
 <p><strong>Safe Lag Window（安全延迟窗口）：</strong>跳过 <code>now - LAG_MINUTES</code> 之后写入的文件，确保某一分钟内的所有 Logpush 文件都已落盘再开始聚合，避免统计结果不完整。</p>
 
@@ -398,6 +398,40 @@ wrangler d1 execute bw-stats \
 
 <p style="font-size:12px;color:var(--muted);margin-top:8px;">
   <em>截图说明：顶部峰值/均值/总量统计卡片，中部分钟级带宽折线图，左侧域名输入框，时间范围选择器，以及右侧系统处理状态。图中域名已打码。</em>
+</p>
+
+
+<!-- ── 告警示例 ── -->
+<h2 id="alerts"><span class="num">8</span> 告警示例</h2>
+
+<p>当回源带宽超过设定阈值或发生突增时，系统自动向配置的 Webhook 渠道发送告警消息。以下为钉钉告警的实际效果示例：</p>
+
+<div style="background:#1a1a2e;border-radius:8px;padding:20px;margin:16px 0;font-family:'PingFang SC',sans-serif;max-width:380px">
+  <div style="background:#fff;border-radius:12px;padding:16px;box-shadow:0 2px 8px rgba(0,0,0,0.15)">
+    <div style="font-size:13px;color:#333;font-weight:600;margin-bottom:12px">🚨 CF 回源带宽超阈值告警</div>
+    <div style="font-size:12px;color:#666;line-height:2">
+      <b>域名：</b> example.com<br>
+      <b>时间：</b> 2026-04-19 11:21 UTC+8<br>
+      <b>当前带宽：</b> <span style="color:#e74c3c;font-weight:600">8.001 Mbps</span><br>
+      <b>设定阈值：</b> 500 Mbps
+    </div>
+    <div style="margin-top:12px;padding:8px 12px;background:#f6821f;color:#fff;text-align:center;border-radius:6px;font-size:12px;font-weight:600">查看监控面板</div>
+  </div>
+  <div style="background:#fff;border-radius:12px;padding:16px;box-shadow:0 2px 8px rgba(0,0,0,0.15);margin-top:10px">
+    <div style="font-size:13px;color:#333;font-weight:600;margin-bottom:12px">⚡ CF 回源带宽突增告警</div>
+    <div style="font-size:12px;color:#666;line-height:2">
+      <b>域名：</b> example.com<br>
+      <b>时间：</b> 2026-04-19 11:21 UTC+8<br>
+      <b>当前带宽：</b> <span style="color:#e74c3c;font-weight:600">8.001 Mbps</span><br>
+      <b>24h历史峰值：</b> 2.667 Mbps<br>
+      <b>当前倍数：</b> <span style="color:#e74c3c;font-weight:600">3.0 倍</span>
+    </div>
+    <div style="margin-top:12px;padding:8px 12px;background:#f6821f;color:#fff;text-align:center;border-radius:6px;font-size:12px;font-weight:600">查看监控面板</div>
+  </div>
+</div>
+
+<p style="font-size:12px;color:var(--muted);margin-top:8px">
+  <em>以上卡片为钉钉机器人告警的模拟展示效果，企业微信和飞书采用类似的卡片消息格式。域名已做脱敏处理。</em>
 </p>
 
 <div class="footer">

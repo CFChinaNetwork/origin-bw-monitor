@@ -2,7 +2,10 @@ name = "origin-bw-monitor"
 main = "src/index.js"
 compatibility_date = "2026-04-01"
 compatibility_flags = ["nodejs_compat"]
-account_id = "0297df3199a94c8082d099ac2212c40a"   # Steve-Tenant-Account-CDN
+# account_id: 部署前填入你的 Cloudflare Account ID
+# 获取方式：CF Dashboard 右上角，或任意页面 URL 中可见
+# 如账号下只有一个账户可省略；多账户环境必须填写
+# account_id = "YOUR_ACCOUNT_ID"
 
 # ── Observability ─────────────────────────────────────────────
 [observability]
@@ -17,66 +20,85 @@ invocation_logs = true
 [triggers]
 crons = ["*/8 * * * *", "0 2 * * *"]
 
-# ── R2 存储桶（Logpush 同一个桶，R2 Binding 只读）─────────────
-# binding 不要改；bucket_name 改为你的 Logpush R2 桶名
+# ── R2 存储桶（与 Logpush 目标桶相同，R2 Binding 只读）────────
+# binding 名称不要修改（index.js 通过此名称访问）
+# bucket_name 改为你的 Logpush R2 桶名
 [[r2_buckets]]
 binding     = "LOGPUSH_BUCKET"
-bucket_name = "cdn-logs-raw"
+bucket_name = "your-logpush-bucket"        # ← 替换为实际 R2 桶名
 
 # ── D1 数据库 ─────────────────────────────────────────────────
+# 先执行 `wrangler d1 create bw-stats` 获取 database_id，填入下方
 [[d1_databases]]
 binding       = "DB"
 database_name = "bw-stats"
-database_id   = "a0546e2b-0487-4124-b4ac-6dad1aa079eb"
+database_id   = "your-d1-database-id"       # ← 替换为 wrangler d1 create 输出的 ID
 
 # ── Queue（由 R2 Event Notification 触发，Worker 消费）────────
 # 注：只需 Consumer，不需要 Producer binding
 # R2 Event Notification 直接向 Queue 发消息，Worker 只消费
 [[queues.consumers]]
 queue             = "bw-ingest-queue"
-max_batch_size    = 3
+max_batch_size    = 3       # 每批最多3个文件，控制内存压力
 max_batch_timeout = 30
 max_retries       = 3
 dead_letter_queue = "bw-ingest-dlq"
 
 [limits]
-cpu_ms = 300000
+cpu_ms = 300000   # Queue Consumer 最大 CPU 时间：5分钟
 
 # ── 配置变量（全部在此，index.js 永不需要修改）────────────────
 [vars]
+
+# 日志级别：debug / info / warn / error
 LOG_LEVEL = "info"
 
-# Logpush 写入 R2 的路径前缀
+# Logpush 写入 R2 的路径前缀（默认格式：logs/YYYYMMDD/文件名.log.gz）
 LOG_PREFIX = "logs/"
 
 # Safe Lag Window（分钟）：等待该分钟内所有 Logpush 文件全部落盘
-# 建议不低于 5 分钟，默认 7 分钟（总延迟约 10 分钟）
+# 建议不低于 5 分钟，默认 7 分钟（总延迟约 10-15 分钟）
 LAG_MINUTES = "7"
 
-# processing 状态超时（分钟），超时则认为 Worker 崩溃，允许重试
+# processing 状态超时阈值（分钟），超时则认为 Worker 已崩溃，允许重试
 MAX_PROCESSING_MIN = "15"
 
 # D1 数据保留天数，每日 UTC 02:00 自动清理
 DATA_RETENTION_DAYS = "7"
 
-# Dashboard 访问鉴权（留空 = 不鉴权）
-# 生产环境建议：wrangler secret put DASHBOARD_TOKEN
+# Dashboard 访问鉴权（留空 = 不鉴权，仅开发调试用）
+# 生产环境强烈建议：wrangler secret put DASHBOARD_TOKEN
 DASHBOARD_TOKEN = ""
 
 # ── 告警配置（留空 = 不启用该告警机制）──────────────────────
-# 固定阈值告警（Mbps），超过即告警，例如 "500"
-ALERT_THRESHOLD_MBPS = "0.1"
 
-# 突增倍数告警（与过去24小时最高值对比），例如 "5"
-ALERT_SPIKE_MULTIPLIER = "2"
+# 固定阈值告警（Mbps），当前分钟带宽超过此值触发
+# 示例："500"（即 500 Mbps），留空 = 不启用
+ALERT_THRESHOLD_MBPS = ""
+
+# 突增倍数告警，当前带宽超过过去24小时最高值的 N 倍时触发
+# 示例："5"（即 5 倍），留空 = 不启用
+ALERT_SPIKE_MULTIPLIER = ""
 
 # 同 zone 同类告警的冷却时间（分钟），防止告警风暴
 ALERT_COOLDOWN_MIN = "30"
 
-# 告警消息里的面板跳转链接（留空则不显示）
-ALERT_DASHBOARD_URL = "https://origin-bw-monitor.steve-account-test.workers.dev"
+# 告警消息中的面板跳转链接（留空则不显示跳转按钮）
+# 示例："https://origin-bw-monitor.your-subdomain.workers.dev"
+ALERT_DASHBOARD_URL = ""
 
 # ── 告警渠道（通过 wrangler secret put 设置，不写在此文件）────
-# 企业微信：wrangler secret put ALERT_WEBHOOK_WECOM
-# 钉钉：    wrangler secret put ALERT_WEBHOOK_DINGTALK
-# 飞书：    wrangler secret put ALERT_WEBHOOK_FEISHU
+#
+# 企业微信机器人 Webhook：
+#   wrangler secret put ALERT_WEBHOOK_WECOM
+#   URL 格式：https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=YOUR_KEY
+#
+# 钉钉机器人 Webhook：
+#   wrangler secret put ALERT_WEBHOOK_DINGTALK
+#   URL 格式：https://oapi.dingtalk.com/robot/send?access_token=YOUR_TOKEN
+#
+# 飞书机器人 Webhook：
+#   wrangler secret put ALERT_WEBHOOK_FEISHU
+#   URL 格式：https://open.feishu.cn/open-apis/bot/v2/hook/YOUR_KEY
+#
+# 三个渠道可任意组合，留空（不设置 secret）= 不启用该渠道

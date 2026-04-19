@@ -81,7 +81,7 @@ export default {
     const path = new URL(request.url).pathname;
     if (path === '/api/stats')       return handleApiStats(request, env);
     if (path === '/api/status')      return handleApiStatus(request, env);
-    if (path === '/api/test-alert')  return handleTestAlert(request, env);
+
     return handleDashboard(request, env);
   },
 };
@@ -563,34 +563,7 @@ async function handleApiStatus(request, env) {
   });
 }
 
-// ═══════════════════════════════════════════════════════════════
-// HTTP Handler：手动触发告警检测（用于测试验证）
-// POST /api/test-alert  可选 body: { "minute": "2026-04-18T16:06" }
-// ═══════════════════════════════════════════════════════════════
-async function handleTestAlert(request, env) {
-  if (request.method !== 'POST') return jsonResponse({ error: 'POST only' }, 405);
 
-  const body = await request.json().catch(() => ({}));
-  // 默认检测 D1 里带宽最高的那一分钟
-  let minute = body.minute;
-  if (!minute) {
-    const row = await env.DB.prepare(
-      `SELECT minute_utc FROM bw_stats ORDER BY sum_bytes DESC LIMIT 1`
-    ).first();
-    minute = row?.minute_utc;
-  }
-  if (!minute) return jsonResponse({ error: 'No data in D1 yet' }, 400);
-
-  const minutesWritten = new Set([minute]);
-  await checkAndAlertFromD1(minutesWritten, env);
-
-  // 查告警是否触发
-  const alerts = (await env.DB.prepare(
-    `SELECT * FROM alert_history ORDER BY alerted_at DESC LIMIT 5`
-  ).all()).results;
-
-  return jsonResponse({ tested_minute: minute, recent_alerts: alerts });
-}
 
 // ═══════════════════════════════════════════════════════════════
 // HTTP Handler：Dashboard 图表页面
